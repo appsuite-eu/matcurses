@@ -70,15 +70,22 @@ pub use widgets::WrappedLine;
 const CONT_INDENT: &str = "  ";
 const REPLY_INDENT: &str = "  ";
 
+/// Marker placed at column 0 of the first wrapped line of a message that
+/// overflows the viewport vertically. It hints that the user can press
+/// `e` to read the full body in `$EDITOR`.
+const OVERFLOW_MARKER: char = '…';
+
 pub fn wrap_view(
     messages: &[Message],
     items: &[ViewItem],
     expanded: &HashSet<usize>,
     width: u16,
+    viewport_height: usize,
 ) -> Vec<WrappedLine> {
     let width = width.max(1) as usize;
     let mut out = Vec::new();
     for (idx, item) in items.iter().enumerate() {
+        let start = out.len();
         let msg = &messages[item.msg_idx];
         match item.kind {
             ItemKind::Top => {
@@ -99,8 +106,30 @@ pub fn wrap_view(
                 render_blocks(&mut out, idx, &header, &r.blocks, width, &cont);
             }
         }
+        // Mark the first line with the overflow indicator if the message
+        // wraps over more lines than the conversation viewport can show
+        // at once. Overflow takes priority over the thread `+`/`-` glyph;
+        // thread state is still discoverable via `d` (details) or by
+        // expand/collapse keys.
+        let line_count = out.len() - start;
+        if viewport_height > 0 && line_count > viewport_height {
+            if let Some(first) = out.get_mut(start) {
+                replace_first_char(&mut first.text, OVERFLOW_MARKER);
+            }
+        }
     }
     out
+}
+
+fn replace_first_char(s: &mut String, new: char) {
+    let first_char = match s.chars().next() {
+        Some(c) => c,
+        None => return,
+    };
+    let head_len = first_char.len_utf8();
+    let mut buf = [0u8; 4];
+    let new_str: &str = new.encode_utf8(&mut buf);
+    s.replace_range(..head_len, new_str);
 }
 
 fn render_blocks(

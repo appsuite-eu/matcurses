@@ -175,8 +175,14 @@ impl App {
             let timeout = self.next_timeout();
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
-                    if let EventOutcome::Quit = handle_key(self, key) {
-                        self.should_quit = true;
+                    match handle_key(self, key) {
+                        EventOutcome::Continue => {}
+                        EventOutcome::Quit => self.should_quit = true,
+                        EventOutcome::OpenEditor(content) => {
+                            if let Err(e) = suspend_for_editor(terminal, &content) {
+                                self.flash = Some(format!("éditeur : {e}"));
+                            }
+                        }
                     }
                 }
             } else {
@@ -464,6 +470,45 @@ impl App {
                 self.flash = Some("réactions indisponibles (hors session)".into());
             }
         }
+    }
+
+    /// Format the currently-focused message (or thread reply) as plain text
+    /// so it can be opened in `$EDITOR` for leisurely reading.
+    pub fn current_message_text(&self) -> String {
+        let item = match self.current_item() {
+            Some(it) => it,
+            None => return String::new(),
+        };
+        let (time, author, blocks) = match item.kind {
+            ItemKind::Top => {
+                let m = &self.messages[item.msg_idx];
+                (m.time.as_str(), m.author.as_str(), &m.blocks)
+            }
+            ItemKind::Reply => {
+                let r = &self.messages[item.msg_idx].replies[item.reply_idx];
+                (r.time.as_str(), r.author.as_str(), &r.blocks)
+            }
+        };
+        let mut out = format!("{} <{}>\n\n", time, author);
+        for block in blocks {
+            match block {
+                Block::Text(t) => {
+                    out.push_str(t);
+                    out.push_str("\n\n");
+                }
+                Block::Code(c) => {
+                    out.push_str("```\n");
+                    out.push_str(c);
+                    out.push_str("\n```\n\n");
+                }
+                Block::Voice { duration_secs } => {
+                    let mins = duration_secs / 60;
+                    let secs = duration_secs % 60;
+                    out.push_str(&format!("[voix {}:{:02}]\n\n", mins, secs));
+                }
+            }
+        }
+        out
     }
 
     pub fn play_current_voice(&mut self) {
@@ -1279,6 +1324,30 @@ fn expand_by_labels(
         }
         return;
     }
+}
+
+/// Leave raw mode + the alternate screen, run `$EDITOR` (default `vi`) on
+/// a temp file containing `content`, then re-enter the TUI.
+fn suspend_for_editor(terminal: &mut DefaultTerminal, content: &str) -> io::Result<()> {
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+
+    let path = std::env::temp_dir().join(format!("matcurses-msg-{}.txt", std::process::id()));
+    std::fs::write(&path, content)?;
+
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let _ = std::process::Command::new(&editor).arg(&path).status();
+
+    enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 fn append_blocks_preview(lines: &mut Vec<String>, blocks: &[Block]) {

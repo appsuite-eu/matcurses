@@ -7,6 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub enum EventOutcome {
     Continue,
     Quit,
+    /// Suspend the TUI and open the given content in `$EDITOR` for
+    /// leisurely reading. Resumes the TUI when the editor exits.
+    OpenEditor(String),
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> EventOutcome {
@@ -144,6 +147,7 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('R') => app.open_reacted_by(),
         KeyCode::Char('v') => app.play_current_voice(),
         KeyCode::Char('V') => app.stop_voice(),
+        KeyCode::Char('e') => return EventOutcome::OpenEditor(app.current_message_text()),
         KeyCode::Char('/') => app.search_start(),
         KeyCode::Char('?') => app.search_start_backward(),
         KeyCode::Char(',') => app.open_settings(),

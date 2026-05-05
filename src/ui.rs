@@ -30,7 +30,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.view {
         View::Conversation => {
             let items = app.visible_items();
-            let wrapped = wrap_view(&app.messages, &items, &app.expanded_threads, main.width);
+            let wrapped = wrap_view(
+                &app.messages,
+                &items,
+                &app.expanded_threads,
+                main.width,
+                main.height as usize,
+            );
             let q = search_query_owned(app);
             let pos = widgets::render_wrapped_list(
                 frame,
