@@ -45,7 +45,8 @@ impl SearchState {
 }
 use crate::modal::{
     ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal, ReactedByModal,
-    ReactionPickerModal,
+    ReactionPickerModal, RecoveryDisplayFocus, RecoveryDisplayModal, RecoveryFocus,
+    RecoveryInputModal,
 };
 use crate::ui::draw;
 use crate::view::login::LoginState;
@@ -775,6 +776,8 @@ impl App {
                 }
             }
             "redact" | "del" => self.open_redact_confirm(),
+            "restore" | "recovery" => self.open_recovery_input(),
+            "setup" | "enable-recovery" => self.enable_recovery(),
             "react" => {
                 if args.is_empty() {
                     self.open_reaction_picker();
@@ -786,6 +789,43 @@ impl App {
             other => {
                 self.flash = Some(format!("commande inconnue : /{other}"));
             }
+        }
+    }
+
+    pub fn enable_recovery(&mut self) {
+        if !self.matrix_logged_in {
+            self.flash = Some("E2EE setup indisponible (hors session)".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::EnableRecovery);
+            self.flash = Some("génération de la clé E2EE…".into());
+        }
+    }
+
+    pub fn open_recovery_input(&mut self) {
+        self.modal = Some(Modal::RecoveryInput(RecoveryInputModal {
+            key: String::new(),
+            focused: RecoveryFocus::Input,
+        }));
+    }
+
+    pub fn submit_recovery_input(&mut self) {
+        let key = match &self.modal {
+            Some(Modal::RecoveryInput(m)) => m.key.clone(),
+            _ => return,
+        };
+        self.modal = None;
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            self.flash = Some("clé de récupération vide".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::RecoverFromKey { key: trimmed });
+            self.flash = Some("restauration en cours…".into());
+        } else {
+            self.flash = Some("Matrix indisponible".into());
         }
     }
 
@@ -801,6 +841,8 @@ impl App {
             "/leave, /part          quitter la room courante".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/react                 ouvrir le picker de réactions".into(),
+            "/setup                 générer la clé E2EE (1re fois sur ce compte)".into(),
+            "/restore, /recovery    importer une clé de récupération E2EE".into(),
             String::new(),
             "Échapper un slash : commencer le message par //".into(),
         ];
@@ -926,6 +968,20 @@ impl App {
                     {
                         m.presence = presence;
                     }
+                }
+            }
+            MxUpdate::RecoveryKeyGenerated { key } => {
+                self.modal = Some(Modal::RecoveryDisplay(RecoveryDisplayModal {
+                    key,
+                    show_nato: false,
+                    focused: RecoveryDisplayFocus::Confirm,
+                }));
+            }
+            MxUpdate::RecoverySuccess => {
+                self.flash = Some("clés restaurées · refetch en cours".into());
+                if let (Some(b), Some(id)) = (self.matrix.as_ref(), self.current_room_id.clone())
+                {
+                    b.send(MxCommand::OpenRoom { room_id: id });
                 }
             }
             MxUpdate::Spaces { roots } => {

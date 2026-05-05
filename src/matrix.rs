@@ -73,6 +73,14 @@ pub enum Command {
     JoinRoom { alias_or_id: String },
     /// Leave the given room.
     LeaveRoom { room_id: String },
+    /// Restore E2EE keys (cross-signing + Megolm key backup) from a
+    /// recovery key string. Used to read historical encrypted messages
+    /// after logging in on a fresh device.
+    RecoverFromKey { key: String },
+    /// Bootstrap E2EE: set up cross-signing + a server-side key backup
+    /// secured by a freshly-generated recovery key. The key is returned
+    /// via `Update::RecoveryKeyGenerated` for the user to save.
+    EnableRecovery,
 }
 
 /// Updates pushed from the Matrix task to the UI.
@@ -107,6 +115,14 @@ pub enum Update {
     },
     /// Spaces tree (in response to LoadSpaces).
     Spaces { roots: Vec<UiNode> },
+    /// E2EE recovery succeeded: keys imported, the UI may want to
+    /// refetch the current room so previously-undecryptable messages
+    /// show up in clear.
+    RecoverySuccess,
+    /// Recovery has been freshly enabled and a new recovery key was
+    /// generated. The UI must show this to the user — they will not
+    /// be able to retrieve it again later.
+    RecoveryKeyGenerated { key: String },
     /// Presence update for a single member, scoped to the room it was
     /// requested from. Fired after `LoadMembers` once each per-user
     /// `GET /presence/{user}/status` response comes back.
@@ -511,6 +527,48 @@ async fn matrix_main(
                                 let _ = tx
                                     .send(Update::Error {
                                         reason: format!("/join : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::EnableRecovery => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match enable_recovery(&c).await {
+                            Ok(key) => {
+                                let _ = tx
+                                    .send(Update::RecoveryKeyGenerated { key })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("setup E2EE : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::RecoverFromKey { key } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match recover_from_key(&c, &key).await {
+                            Ok(()) => {
+                                let _ = tx.send(Update::RecoverySuccess).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("recovery : {e}"),
                                     })
                                     .await;
                             }
@@ -1295,6 +1353,28 @@ async fn leave_room(
     let room = client.get_room(&parsed).ok_or("room introuvable")?;
     room.leave().await?;
     Ok(())
+}
+
+async fn recover_from_key(
+    client: &Client,
+    key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err("clé de récupération vide".into());
+    }
+    client.encryption().recovery().recover(trimmed).await?;
+    Ok(())
+}
+
+async fn enable_recovery(
+    client: &Client,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // `enable()` provisions cross-signing keys + a server-side key backup
+    // (Megolm session keys), generating a fresh recovery key string that
+    // the user MUST save: there is no way to retrieve it later.
+    let key = client.encryption().recovery().enable().await?;
+    Ok(key)
 }
 
 /// Send a plain text message into the room.

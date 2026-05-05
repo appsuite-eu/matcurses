@@ -1,5 +1,5 @@
 use crate::app::{App, Focus, View};
-use crate::modal::{ConfirmButton, Modal};
+use crate::modal::{ConfirmButton, Modal, RecoveryDisplayFocus, RecoveryFocus};
 use crate::view::login::{self as login_view};
 use crate::view::settings::{self as settings_view, SettingsState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -123,6 +123,50 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             KeyCode::Up => r.selected = r.selected.saturating_sub(1),
             KeyCode::Down => {
                 r.selected = (r.selected + 1).min(r.entries.len().saturating_sub(1));
+            }
+            _ => {}
+        },
+        Modal::RecoveryDisplay(d) => match key.code {
+            KeyCode::Esc => app.close_modal(),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                d.focused = match d.focused {
+                    RecoveryDisplayFocus::Confirm => RecoveryDisplayFocus::Cancel,
+                    RecoveryDisplayFocus::Cancel => RecoveryDisplayFocus::Confirm,
+                };
+            }
+            KeyCode::Char('n') => d.show_nato = !d.show_nato,
+            KeyCode::Enter => match d.focused {
+                RecoveryDisplayFocus::Confirm => {
+                    app.close_modal();
+                    app.flash = Some("clé E2EE prête · note-la bien".into());
+                }
+                RecoveryDisplayFocus::Cancel => {
+                    app.close_modal();
+                    app.flash =
+                        Some("clé non confirmée — note-la AVANT toute restauration".into());
+                }
+            },
+            _ => {}
+        },
+        Modal::RecoveryInput(r) => match key.code {
+            KeyCode::Esc => app.close_modal(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                r.focused = match r.focused {
+                    RecoveryFocus::Input => RecoveryFocus::Submit,
+                    RecoveryFocus::Submit => RecoveryFocus::Cancel,
+                    RecoveryFocus::Cancel => RecoveryFocus::Input,
+                };
+            }
+            KeyCode::Enter => match r.focused {
+                RecoveryFocus::Input => r.focused = RecoveryFocus::Submit,
+                RecoveryFocus::Submit => app.submit_recovery_input(),
+                RecoveryFocus::Cancel => app.close_modal(),
+            },
+            KeyCode::Char(c) if r.focused == RecoveryFocus::Input => {
+                r.key.push(c);
+            }
+            KeyCode::Backspace if r.focused == RecoveryFocus::Input => {
+                r.key.pop();
             }
             _ => {}
         },
