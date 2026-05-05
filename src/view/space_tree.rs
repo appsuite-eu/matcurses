@@ -32,7 +32,7 @@ pub struct SpaceTreeState {
 impl SpaceTreeState {
     pub fn new() -> Self {
         Self {
-            roots: mock_tree(),
+            roots: Vec::new(),
             list: ListState::new(),
         }
     }
@@ -297,86 +297,3 @@ pub fn render(
     cursor
 }
 
-fn mock_tree() -> Vec<Node> {
-    vec![
-        Node {
-            label: "Boulot".into(),
-            kind: NodeKind::Space {
-                expanded: true,
-                children: vec![
-                    Node {
-                        label: "#dev".into(),
-                        kind: NodeKind::Room {
-                            name: "#dev".into(),
-                            unread: 3,
-                        },
-                    },
-                    Node {
-                        label: "#alerts".into(),
-                        kind: NodeKind::Room {
-                            name: "#alerts".into(),
-                            unread: 12,
-                        },
-                    },
-                    Node {
-                        label: "Backend".into(),
-                        kind: NodeKind::Space {
-                            expanded: false,
-                            children: vec![
-                                Node {
-                                    label: "#backend".into(),
-                                    kind: NodeKind::Room {
-                                        name: "#backend".into(),
-                                        unread: 0,
-                                    },
-                                },
-                                Node {
-                                    label: "#infra".into(),
-                                    kind: NodeKind::Room {
-                                        name: "#infra".into(),
-                                        unread: 1,
-                                    },
-                                },
-                            ],
-                        },
-                    },
-                ],
-            },
-        },
-        Node {
-            label: "Communauté".into(),
-            kind: NodeKind::Space {
-                expanded: false,
-                children: vec![
-                    Node {
-                        label: "#a11y".into(),
-                        kind: NodeKind::Room {
-                            name: "#a11y".into(),
-                            unread: 0,
-                        },
-                    },
-                    Node {
-                        label: "#opensource".into(),
-                        kind: NodeKind::Room {
-                            name: "#opensource".into(),
-                            unread: 5,
-                        },
-                    },
-                ],
-            },
-        },
-        Node {
-            label: "Perso".into(),
-            kind: NodeKind::Space {
-                expanded: false,
-                children: vec![Node {
-                    label: "@alice".into(),
-                    kind: NodeKind::Room {
-                        name: "@alice:matrix.org".into(),
-                        unread: 4,
-                    },
-                }],
-            },
-        },
-    ]
-}

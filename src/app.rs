@@ -1,7 +1,7 @@
 use crate::event::{handle_key, EventOutcome};
 use crate::matrix::{Command as MxCommand, MatrixBridge, Update as MxUpdate};
 use crate::message::{
-    build_visible_items, mock_messages, Block, ItemKind, Message, Reaction, ViewItem,
+    build_visible_items, Block, ItemKind, Message, Reaction, ViewItem,
 };
 use std::time::{Duration, Instant};
 
@@ -135,21 +135,17 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let messages = mock_messages_with_extras();
-        let expanded = HashSet::new();
-        let visible = build_visible_items(&messages, &expanded);
-        let selected = visible.len().saturating_sub(1);
         let mut s = Self {
             view: View::Conversation,
             focus: Focus::Conversation,
             input: String::new(),
             input_mode: InputMode::Normal,
-            current_room: "#dev".to_string(),
+            current_room: String::new(),
             status_text: String::new(),
             should_quit: false,
-            messages,
-            expanded_threads: expanded,
-            selected,
+            messages: Vec::new(),
+            expanded_threads: HashSet::new(),
+            selected: 0,
             scroll_top: 0,
             last_main_height: 0,
             modal: None,
@@ -348,7 +344,7 @@ impl App {
                 lines.push(format!("Réponses: {}", msg.replies.len()));
                 lines.push(format!("Réactions: {}", msg.reactions.len()));
                 lines.push(String::new());
-                lines.push("État    : envoyé · non édité · non chiffré (mock)".into());
+                lines.push("État    : envoyé".into());
                 if !msg.reactions.is_empty() {
                     lines.push(String::new());
                     lines.push("Réactions :".into());
@@ -372,7 +368,7 @@ impl App {
                 ));
                 lines.push(format!("Index   : réponse {}", item.reply_idx));
                 lines.push(String::new());
-                lines.push("État    : envoyé · non édité · non chiffré (mock)".into());
+                lines.push("État    : envoyé".into());
                 lines.push(String::new());
                 lines.push("Aperçu  :".into());
                 append_blocks_preview(&mut lines, &r.blocks);
@@ -516,31 +512,59 @@ impl App {
         }
     }
 
-    pub fn switch_room(&mut self, name: &str) {
-        self.current_room = name.to_string();
-        // If Matrix is connected, fetch the matching id and trigger the load.
-        if self.matrix_logged_in {
-            let idx = self
-                .room_list_state
-                .rooms
-                .iter()
-                .position(|r| r.name == name);
-            if let Some(idx) = idx {
-                if let Some(id) = self.room_ids.get(idx).cloned() {
-                    self.current_room_id = Some(id.clone());
-                    if let Some(b) = self.matrix.as_ref() {
-                        b.send(MxCommand::OpenRoom { room_id: id });
-                    }
-                    self.flash = Some(format!("ouverture {}", name));
-                } else {
-                    self.flash = Some(format!("room {} : id manquant", name));
-                }
-            } else {
-                self.flash = Some(format!("room {} introuvable", name));
-            }
-        } else {
-            self.flash = Some(format!("ouverture {} (mock)", name));
+    /// Switch to a room. The argument may be either a display name (from F4)
+    /// or a Matrix room_id (from F3, where the tree stores ids).
+    pub fn switch_room(&mut self, name_or_id: &str) {
+        // Try match-by-name first, then match-by-id.
+        let mut idx = self
+            .room_list_state
+            .rooms
+            .iter()
+            .position(|r| r.name == name_or_id);
+        if idx.is_none() {
+            idx = self.room_ids.iter().position(|id| id == name_or_id);
         }
+
+        if !self.matrix_logged_in {
+            self.current_room = name_or_id.to_string();
+            self.flash = Some(format!("ouverture {} (mock)", name_or_id));
+            self.view = View::Conversation;
+            self.update_status();
+            return;
+        }
+
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                self.flash = Some(format!("room {} introuvable", name_or_id));
+                self.view = View::Conversation;
+                self.update_status();
+                return;
+            }
+        };
+
+        let display = self.room_list_state.rooms[idx].name.clone();
+        let id = match self.room_ids.get(idx).cloned() {
+            Some(i) => i,
+            None => {
+                self.flash = Some(format!("room {} : id manquant", display));
+                return;
+            }
+        };
+
+        self.current_room = display.clone();
+        self.current_room_id = Some(id.clone());
+        // Clear any previous messages (mock or previous room) so the user
+        // doesn't see stale data while real messages load.
+        self.messages.clear();
+        self.expanded_threads.clear();
+        self.selected = 0;
+        self.scroll_top = 0;
+
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::OpenRoom { room_id: id });
+        }
+        self.flash = Some(format!("ouverture {}", display));
         self.view = View::Conversation;
         self.update_status();
     }
@@ -698,8 +722,26 @@ impl App {
                 }
             }
             MxUpdate::Spaces { roots } => {
+                // Preserve user state across reloads: keep the currently
+                // selected path and re-expand any space that was open before.
+                let prev_path = self
+                    .space_tree_state
+                    .flat()
+                    .get(self.space_tree_state.selected())
+                    .map(|it| it.path.clone());
+                let prev_expanded = collect_expanded_labels(&self.space_tree_state.roots);
+
                 self.space_tree_state.roots = roots;
-                self.space_tree_state.set_selected(0);
+
+                for label_path in &prev_expanded {
+                    expand_by_labels(&mut self.space_tree_state.roots, label_path);
+                }
+
+                let pos = prev_path
+                    .as_deref()
+                    .and_then(|p| self.space_tree_state.find_pos(p))
+                    .unwrap_or(0);
+                self.space_tree_state.set_selected(pos);
             }
         }
     }
@@ -715,8 +757,8 @@ impl App {
             format!("Rôle    : {} (level {})", m.power_label(), m.power_level),
             format!("Présence: {}", m.presence.label()),
             String::new(),
-            "Devices : 2 vérifiés (mock)".into(),
-            "Vérifié : oui (mock)".into(),
+            "Devices : (non chargé)".into(),
+            "Vérifié : (non chargé)".into(),
         ];
         self.modal = Some(Modal::Details(DetailsModal {
             title: "Membre".into(),
@@ -1131,6 +1173,61 @@ fn reply_text(r: &crate::message::ThreadReply) -> String {
     s
 }
 
+fn collect_expanded_labels(
+    nodes: &[crate::view::space_tree::Node],
+) -> Vec<Vec<String>> {
+    fn walk(
+        node: &crate::view::space_tree::Node,
+        path: &[String],
+        out: &mut Vec<Vec<String>>,
+    ) {
+        if let crate::view::space_tree::NodeKind::Space {
+            expanded, children, ..
+        } = &node.kind
+        {
+            let mut p = path.to_vec();
+            p.push(node.label.clone());
+            if *expanded {
+                out.push(p.clone());
+            }
+            for c in children {
+                walk(c, &p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for n in nodes {
+        walk(n, &[], &mut out);
+    }
+    out
+}
+
+fn expand_by_labels(
+    nodes: &mut [crate::view::space_tree::Node],
+    label_path: &[String],
+) {
+    if label_path.is_empty() {
+        return;
+    }
+    let head = &label_path[0];
+    let rest = &label_path[1..];
+    for node in nodes.iter_mut() {
+        if &node.label != head {
+            continue;
+        }
+        if let crate::view::space_tree::NodeKind::Space {
+            expanded, children, ..
+        } = &mut node.kind
+        {
+            *expanded = true;
+            if !rest.is_empty() {
+                expand_by_labels(children, rest);
+            }
+        }
+        return;
+    }
+}
+
 fn append_blocks_preview(lines: &mut Vec<String>, blocks: &[Block]) {
     for block in blocks {
         match block {
@@ -1155,35 +1252,3 @@ fn append_blocks_preview(lines: &mut Vec<String>, blocks: &[Block]) {
     }
 }
 
-fn mock_messages_with_extras() -> Vec<Message> {
-    let mut messages = mock_messages();
-    // Voice notes
-    messages.insert(5, Message::voice("09:04", "carol", 28));
-    messages.push(Message::voice("10:06", "dave", 73));
-    // Reactions on a few messages
-    let alice_postmortem_idx = messages
-        .iter()
-        .position(|m| m.author == "alice" && m.time == "10:02")
-        .unwrap_or(0);
-    messages[alice_postmortem_idx]
-        .reactions
-        .push(Reaction {
-            key: "+1".into(),
-            users: vec!["bob".into(), "carol".into(), "dave".into()],
-        });
-    messages[alice_postmortem_idx]
-        .reactions
-        .push(Reaction {
-            key: "heart".into(),
-            users: vec!["carol".into()],
-        });
-    let go_idx = messages
-        .iter()
-        .position(|m| m.author == "alice" && m.time == "10:05")
-        .unwrap_or(0);
-    messages[go_idx].reactions.push(Reaction {
-        key: "fire".into(),
-        users: vec!["bob".into(), "dave".into()],
-    });
-    messages
-}

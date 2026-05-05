@@ -14,13 +14,12 @@ use std::time::Duration;
 use matrix_sdk::matrix_auth::MatrixSession;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::{MessagesOptions, RoomMember};
-use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
 };
 use matrix_sdk::ruma::events::AnyMessageLikeEventContent;
 use matrix_sdk::ruma::OwnedRoomId;
-use matrix_sdk::{Client, RoomMemberships};
+use matrix_sdk::{Client, RoomMemberships, RoomState};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -749,17 +748,26 @@ async fn load_room_messages(
         None => return Err("room introuvable".into()),
     };
 
+    // If the room is an open invite, accept it before fetching messages.
+    // Otherwise the homeserver returns 403 (user not in room).
+    match room.state() {
+        RoomState::Joined => {}
+        RoomState::Invited => {
+            room.join().await?;
+        }
+        RoomState::Left => return Err("room quittée".into()),
+    }
+
     let mut opts = MessagesOptions::backward();
     opts.limit = matrix_sdk::ruma::UInt::from(50u32);
-    let mut filter = RoomEventFilter::default();
-    filter.types = Some(vec!["m.room.message".to_owned()]);
-    opts.filter = filter;
+    // No server-side type filter: encrypted rooms ship `m.room.encrypted`
+    // events that the SDK decrypts client-side. A `m.room.message` filter
+    // would strip them before we get a chance.
 
     let chunk = room.messages(opts).await?;
 
     let mut out = Vec::new();
     for tev in chunk.chunk.iter().rev() {
-        // tev: matrix_sdk::deserialized_responses::TimelineEvent
         let raw = tev.event.deserialize();
         let raw = match raw {
             Ok(e) => e,
@@ -767,13 +775,26 @@ async fn load_room_messages(
         };
         use matrix_sdk::ruma::events::AnyTimelineEvent;
         if let AnyTimelineEvent::MessageLike(ml) = raw {
-            if let Some(content) = ml.original_content() {
-                if let AnyMessageLikeEventContent::RoomMessage(rmc) = content {
+            match ml.original_content() {
+                Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => {
                     let sender = ml.sender().to_string();
                     let ts = ml.origin_server_ts();
                     let msg = event_content_to_message(&sender, &rmc.msgtype, ts.0.into());
                     out.push(msg);
                 }
+                Some(AnyMessageLikeEventContent::RoomEncrypted(_)) => {
+                    // Decryption failed (likely missing Megolm session key).
+                    let sender = ml.sender().to_string();
+                    let ts = ml.origin_server_ts();
+                    out.push(Message {
+                        time: format_time(ts.0.into()),
+                        author: short_author(&sender),
+                        blocks: vec![Block::Text("[chiffré · clé manquante]".into())],
+                        replies: Vec::new(),
+                        reactions: Vec::new(),
+                    });
+                }
+                _ => {}
             }
         }
     }

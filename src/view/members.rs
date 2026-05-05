@@ -7,6 +7,7 @@ use ratatui::{
 use widgets::{render_list, ListRow, ListState};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Presence {
     Online,
     Idle,
@@ -67,7 +68,7 @@ pub struct MembersState {
 impl MembersState {
     pub fn new() -> Self {
         Self {
-            members: mock_members(),
+            members: Vec::new(),
             list: ListState::new(),
         }
     }
@@ -110,7 +111,7 @@ pub fn render(
     search_query: Option<&str>,
 ) -> (u16, u16) {
     frame.render_widget(
-        Paragraph::new(format!("Membres de #dev — {}", s.members.len()))
+        Paragraph::new(format!("Membres ({})", s.members.len()))
             .style(Style::default().add_modifier(Modifier::BOLD)),
         Rect {
             x: area.x + 2,
@@ -158,79 +159,3 @@ pub fn render(
     cursor
 }
 
-fn mock_members() -> Vec<Member> {
-    vec![
-        Member {
-            mxid: "@alice:matrix.org".into(),
-            displayname: "alice".into(),
-            power_level: 100,
-            presence: Presence::Online,
-        },
-        Member {
-            mxid: "@bob:matrix.org".into(),
-            displayname: "bob".into(),
-            power_level: 50,
-            presence: Presence::Online,
-        },
-        Member {
-            mxid: "@carol:matrix.org".into(),
-            displayname: "carol".into(),
-            power_level: 50,
-            presence: Presence::Idle,
-        },
-        Member {
-            mxid: "@dave:matrix.org".into(),
-            displayname: "dave".into(),
-            power_level: 0,
-            presence: Presence::Online,
-        },
-        Member {
-            mxid: "@eve:matrix.org".into(),
-            displayname: "eve".into(),
-            power_level: 0,
-            presence: Presence::Offline,
-        },
-        Member {
-            mxid: "@frank:matrix.org".into(),
-            displayname: "frank".into(),
-            power_level: 0,
-            presence: Presence::Idle,
-        },
-        Member {
-            mxid: "@grace:matrix.org".into(),
-            displayname: "grace".into(),
-            power_level: 0,
-            presence: Presence::Online,
-        },
-        Member {
-            mxid: "@heidi:matrix.org".into(),
-            displayname: "heidi".into(),
-            power_level: 0,
-            presence: Presence::Offline,
-        },
-        Member {
-            mxid: "@ivan:matrix.org".into(),
-            displayname: "ivan".into(),
-            power_level: 0,
-            presence: Presence::Unavailable,
-        },
-        Member {
-            mxid: "@judy:matrix.org".into(),
-            displayname: "judy".into(),
-            power_level: 0,
-            presence: Presence::Online,
-        },
-        Member {
-            mxid: "@matrix-bot:matrix.org".into(),
-            displayname: "matrix-bot".into(),
-            power_level: 0,
-            presence: Presence::Online,
-        },
-        Member {
-            mxid: "@deploy-bot:matrix.org".into(),
-            displayname: "deploy-bot".into(),
-            power_level: 0,
-            presence: Presence::Online,
-        },
-    ]
-}

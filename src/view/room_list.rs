@@ -21,14 +21,13 @@ pub struct RoomListState {
 
 impl RoomListState {
     pub fn new() -> Self {
-        let mut s = Self {
-            rooms: mock_rooms(),
+        Self {
+            rooms: Vec::new(),
             list: ListState::new(),
-        };
-        s.sort();
-        s
+        }
     }
 
+    #[allow(dead_code)]
     pub fn sort(&mut self) {
         self.rooms.sort_by(|a, b| {
             let a_unread = a.unread > 0;
@@ -137,98 +136,3 @@ pub fn render(
     cursor
 }
 
-fn mock_rooms() -> Vec<Room> {
-    vec![
-        Room {
-            name: "#dev".into(),
-            unread: 3,
-            mentions: 1,
-            pinned: true,
-            muted: false,
-        },
-        Room {
-            name: "#general".into(),
-            unread: 0,
-            mentions: 0,
-            pinned: true,
-            muted: false,
-        },
-        Room {
-            name: "#alerts".into(),
-            unread: 12,
-            mentions: 0,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "#postmortems".into(),
-            unread: 0,
-            mentions: 0,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "#random".into(),
-            unread: 47,
-            mentions: 0,
-            pinned: false,
-            muted: true,
-        },
-        Room {
-            name: "#frontend".into(),
-            unread: 2,
-            mentions: 0,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "#backend".into(),
-            unread: 0,
-            mentions: 0,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "#infra".into(),
-            unread: 1,
-            mentions: 1,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "#a11y".into(),
-            unread: 0,
-            mentions: 0,
-            pinned: true,
-            muted: false,
-        },
-        Room {
-            name: "@alice:matrix.org".into(),
-            unread: 4,
-            mentions: 4,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "@bob:matrix.org".into(),
-            unread: 0,
-            mentions: 0,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "@carol:matrix.org".into(),
-            unread: 1,
-            mentions: 0,
-            pinned: false,
-            muted: false,
-        },
-        Room {
-            name: "#archives".into(),
-            unread: 0,
-            mentions: 0,
-            pinned: false,
-            muted: true,
-        },
-    ]
-}
