@@ -201,7 +201,36 @@ fn render_blocks(
     }
 }
 
+/// Wrap a text body to width. Respects explicit line breaks: `\n` (and
+/// `\r\n`) split the text into paragraphs, each wrapped independently.
+/// Empty paragraphs are preserved as blank lines so multi-line formatting
+/// from the sender (e.g., a help message from a bridge bot) is visible.
 fn wrap_text_with_budgets(text: &str, first_budget: usize, cont_budget: usize) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n");
+    let mut all_lines: Vec<String> = Vec::new();
+    let mut on_first_paragraph = true;
+    for paragraph in normalized.split('\n') {
+        if paragraph.is_empty() {
+            all_lines.push(String::new());
+            on_first_paragraph = false;
+            continue;
+        }
+        let para_first = if on_first_paragraph {
+            first_budget
+        } else {
+            cont_budget
+        };
+        let lines = wrap_paragraph(paragraph, para_first, cont_budget);
+        all_lines.extend(lines);
+        on_first_paragraph = false;
+    }
+    if all_lines.is_empty() {
+        all_lines.push(String::new());
+    }
+    all_lines
+}
+
+fn wrap_paragraph(text: &str, first_budget: usize, cont_budget: usize) -> Vec<String> {
     let first_budget = first_budget.max(1);
     let cont_budget = cont_budget.max(1);
     let mut lines: Vec<String> = Vec::new();
