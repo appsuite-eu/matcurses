@@ -456,21 +456,43 @@ impl App {
             Some(it) => it,
             None => return,
         };
-        let blocks = match item.kind {
-            ItemKind::Top => &self.messages[item.msg_idx].blocks,
+        let (blocks, event_id) = match item.kind {
+            ItemKind::Top => {
+                let m = &self.messages[item.msg_idx];
+                (&m.blocks, m.event_id.clone())
+            }
             ItemKind::Reply => {
-                &self.messages[item.msg_idx].replies[item.reply_idx].blocks
+                let r = &self.messages[item.msg_idx].replies[item.reply_idx];
+                (&r.blocks, r.event_id.clone())
             }
         };
-        for b in blocks {
-            if let Block::Voice { duration_secs } = b {
-                let mins = duration_secs / 60;
-                let secs = duration_secs % 60;
-                self.flash = Some(format!("lecture voix {}:{:02} (mock)", mins, secs));
-                return;
+        let has_voice = blocks.iter().any(|b| matches!(b, Block::Voice { .. }));
+        if !has_voice {
+            self.flash = Some("pas de note vocale ici".into());
+            return;
+        }
+        match (
+            self.matrix_logged_in,
+            self.current_room_id.clone(),
+            event_id.is_empty(),
+        ) {
+            (true, Some(room_id), false) => {
+                if let Some(b) = self.matrix.as_ref() {
+                    b.send(MxCommand::PlayVoice { room_id, event_id });
+                    self.flash = Some("téléchargement de la note vocale…".into());
+                }
+            }
+            _ => {
+                self.flash = Some("lecture indisponible (hors session Matrix)".into());
             }
         }
-        self.flash = Some("pas de note vocale ici".into());
+    }
+
+    pub fn stop_voice(&mut self) {
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::StopVoice);
+            self.flash = Some("lecture arrêtée".into());
+        }
     }
 
     pub fn open_settings(&mut self) {

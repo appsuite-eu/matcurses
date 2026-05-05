@@ -16,6 +16,7 @@ pub struct ThreadReply {
     pub time: String,
     pub author: String,
     pub blocks: Vec<Block>,
+    pub event_id: String,
 }
 
 pub struct Message {
@@ -24,6 +25,7 @@ pub struct Message {
     pub blocks: Vec<Block>,
     pub replies: Vec<ThreadReply>,
     pub reactions: Vec<Reaction>,
+    pub event_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

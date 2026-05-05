@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod event;
 mod matrix;
 mod message;

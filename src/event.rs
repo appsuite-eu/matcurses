@@ -143,6 +143,7 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('r') => app.open_reaction_picker(),
         KeyCode::Char('R') => app.open_reacted_by(),
         KeyCode::Char('v') => app.play_current_voice(),
+        KeyCode::Char('V') => app.stop_voice(),
         KeyCode::Char('/') => app.search_start(),
         KeyCode::Char('?') => app.search_start_backward(),
         KeyCode::Char(',') => app.open_settings(),

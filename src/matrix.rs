@@ -13,12 +13,13 @@ use std::time::Duration;
 
 use matrix_sdk::matrix_auth::MatrixSession;
 use matrix_sdk::config::SyncSettings;
+use matrix_sdk::media::{MediaFormat, MediaRequest};
 use matrix_sdk::room::{MessagesOptions, RoomMember};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
 };
 use matrix_sdk::ruma::events::AnyMessageLikeEventContent;
-use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use matrix_sdk::{Client, RoomMemberships, RoomState};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -51,6 +52,12 @@ pub enum Command {
     /// Try to restore a previous session from the SQLite store.
     /// On success → Update::LoggedIn + continuous sync. Otherwise → silence.
     TryRestore,
+    /// Download the audio media for the given event and play it through
+    /// the in-process rodio player (with fallback to the system player if
+    /// the format is not supported, e.g. Opus).
+    PlayVoice { room_id: String, event_id: String },
+    /// Stop the currently-playing voice note, if any.
+    StopVoice,
 }
 
 /// Updates pushed from the Matrix task to the UI.
@@ -87,6 +94,15 @@ pub enum Update {
     Spaces { roots: Vec<UiNode> },
 }
 
+/// Audio commands sent to the dedicated audio thread.
+enum AudioCommand {
+    Play {
+        bytes: Vec<u8>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Stop,
+}
+
 /// UI-side bridge. Owns the sender/receiver and the tokio runtime.
 pub struct MatrixBridge {
     pub cmd_tx: Sender<Command>,
@@ -104,7 +120,12 @@ impl MatrixBridge {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
         let (update_tx, update_rx) = mpsc::channel::<Update>(64);
 
-        runtime.spawn(matrix_main(cmd_rx, update_tx));
+        // Dedicated audio thread (rodio's OutputStream is !Send so it must
+        // live on a single thread that owns it).
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        std::thread::spawn(move || audio_thread(audio_rx));
+
+        runtime.spawn(matrix_main(cmd_rx, update_tx, audio_tx));
 
         Ok(Self {
             cmd_tx,
@@ -132,8 +153,72 @@ impl MatrixBridge {
     }
 }
 
+/// Audio playback thread: owns the rodio OutputStream and processes
+/// AudioCommands one at a time. Runs until the channel is closed.
+fn audio_thread(rx: std::sync::mpsc::Receiver<AudioCommand>) {
+    let stream_pair = match rodio::OutputStream::try_default() {
+        Ok(p) => p,
+        Err(_) => return, // No audio device — silently drop further commands.
+    };
+    let (_stream, handle) = stream_pair;
+    let mut current: Option<rodio::Sink> = None;
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            AudioCommand::Play { bytes, ack } => {
+                if let Some(s) = current.take() {
+                    s.stop();
+                }
+                match try_play(&handle, bytes) {
+                    Ok(sink) => {
+                        current = Some(sink);
+                        let _ = ack.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = ack.send(Err(e));
+                    }
+                }
+            }
+            AudioCommand::Stop => {
+                if let Some(s) = current.take() {
+                    s.stop();
+                }
+            }
+        }
+    }
+}
+
+/// Try to decode `bytes` and produce a playing `Sink`. Tries rodio's built-in
+/// decoders first (MP3/M4A/FLAC/WAV/Vorbis via Symphonia), then falls back
+/// to our custom OGG/Opus path.
+fn try_play(
+    handle: &rodio::OutputStreamHandle,
+    bytes: Vec<u8>,
+) -> Result<rodio::Sink, String> {
+    // First attempt: rodio + Symphonia.
+    let bytes_for_rodio = bytes.clone();
+    if let Ok(source) = rodio::Decoder::new(std::io::Cursor::new(bytes_for_rodio)) {
+        let sink = rodio::Sink::try_new(handle).map_err(|e| format!("sink : {e}"))?;
+        sink.append(source);
+        return Ok(sink);
+    }
+    // Second attempt: OGG/Opus (covers the common voice-note case).
+    match crate::audio::OpusSource::try_from_bytes(bytes) {
+        Ok(source) => {
+            let sink = rodio::Sink::try_new(handle).map_err(|e| format!("sink : {e}"))?;
+            sink.append(source);
+            Ok(sink)
+        }
+        Err(opus_err) => Err(format!("aucun décodeur supporté ({opus_err})")),
+    }
+}
+
 /// Main loop of the Matrix task: receives commands, drives the client.
-async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
+async fn matrix_main(
+    mut cmd_rx: Receiver<Command>,
+    update_tx: Sender<Update>,
+    audio_tx: std::sync::mpsc::Sender<AudioCommand>,
+) {
     let mut client: Option<Arc<Client>> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
@@ -260,6 +345,89 @@ async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
                         }
                     });
                 }
+            }
+            Command::PlayVoice { room_id, event_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    let audio_tx = audio_tx.clone();
+                    tokio::spawn(async move {
+                        match download_voice(&c, &room_id, &event_id).await {
+                            Ok((bytes, mime)) => {
+                                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                                let bytes_clone = bytes.clone();
+                                if audio_tx
+                                    .send(AudioCommand::Play {
+                                        bytes: bytes_clone,
+                                        ack: ack_tx,
+                                    })
+                                    .is_err()
+                                {
+                                    let _ = tx
+                                        .send(Update::Error {
+                                            reason: "audio thread indisponible".into(),
+                                        })
+                                        .await;
+                                    return;
+                                }
+                                match ack_rx.await {
+                                    Ok(Ok(())) => {
+                                        let _ = tx
+                                            .send(Update::Error {
+                                                reason: "lecture en cours".into(),
+                                            })
+                                            .await;
+                                    }
+                                    Ok(Err(decode_err)) => {
+                                        // Format not decodable in-process (commonly Opus).
+                                        // Fall back to writing a temp file and opening it
+                                        // with the system audio player.
+                                        match save_and_open(
+                                            &bytes,
+                                            &event_id,
+                                            ext_for_mime(mime.as_deref()),
+                                        ) {
+                                            Ok(_) => {
+                                                let _ = tx.send(Update::Error {
+                                                    reason: format!(
+                                                        "format non géré ({}); ouverture player externe",
+                                                        decode_err
+                                                    ),
+                                                })
+                                                .await;
+                                            }
+                                            Err(e2) => {
+                                                let _ = tx.send(Update::Error {
+                                                    reason: format!(
+                                                        "lecture KO : {decode_err} / {e2}"
+                                                    ),
+                                                })
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let _ = tx
+                                            .send(Update::Error {
+                                                reason: "audio thread mort".into(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("lecture voix : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::StopVoice => {
+                let _ = audio_tx.send(AudioCommand::Stop);
             }
             Command::LoadSpaces => {
                 if let Some(c) = &client {
@@ -657,6 +825,7 @@ async fn run_sync(client: Arc<Client>, tx: Sender<Update>) {
                     None => return, // redaction
                 };
                 let msg = event_content_to_message(
+                    &original.event_id.to_string(),
                     &original.sender.to_string(),
                     &original.content.msgtype,
                     original.origin_server_ts.0.into(),
@@ -775,11 +944,17 @@ async fn load_room_messages(
         };
         use matrix_sdk::ruma::events::AnyTimelineEvent;
         if let AnyTimelineEvent::MessageLike(ml) = raw {
+            let event_id = ml.event_id().to_string();
             match ml.original_content() {
                 Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => {
                     let sender = ml.sender().to_string();
                     let ts = ml.origin_server_ts();
-                    let msg = event_content_to_message(&sender, &rmc.msgtype, ts.0.into());
+                    let msg = event_content_to_message(
+                        &event_id,
+                        &sender,
+                        &rmc.msgtype,
+                        ts.0.into(),
+                    );
                     out.push(msg);
                 }
                 Some(AnyMessageLikeEventContent::RoomEncrypted(_)) => {
@@ -792,6 +967,7 @@ async fn load_room_messages(
                         blocks: vec![Block::Text("[chiffré · clé manquante]".into())],
                         replies: Vec::new(),
                         reactions: Vec::new(),
+                        event_id,
                     });
                 }
                 _ => {}
@@ -823,17 +999,101 @@ async fn do_send(
     Ok(())
 }
 
-/// Convertit un MessageType (room message) vers notre `Message` UI.
-fn event_content_to_message(sender: &str, msgtype: &MessageType, ts_ms: u64) -> Message {
-    let time = format_time(ts_ms);
-    let author = short_author(sender);
-    let blocks = msgtype_to_blocks(msgtype);
+/// Convert an `m.room.message` event content to our UI `Message`.
+fn event_content_to_message(
+    event_id: &str,
+    sender: &str,
+    msgtype: &MessageType,
+    ts_ms: u64,
+) -> Message {
     Message {
-        time,
-        author,
-        blocks,
+        time: format_time(ts_ms),
+        author: short_author(sender),
+        blocks: msgtype_to_blocks(msgtype),
         replies: Vec::new(),
         reactions: Vec::new(),
+        event_id: event_id.to_string(),
+    }
+}
+
+/// Fetch the audio bytes for a given event (auto-decrypts E2EE attachments
+/// via the SDK). Returns the raw bytes and the optional mime type.
+async fn download_voice(
+    client: &Client,
+    room_id: &str,
+    event_id: &str,
+) -> Result<(Vec<u8>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    let parsed_event: OwnedEventId = event_id.parse()?;
+
+    let timeline_event = room.event(&parsed_event).await?;
+    let raw = timeline_event.event.deserialize()?;
+
+    use matrix_sdk::ruma::events::AnyTimelineEvent;
+    let (source, mime) = match raw {
+        AnyTimelineEvent::MessageLike(ml) => match ml.original_content() {
+            Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => match rmc.msgtype {
+                MessageType::Audio(audio) => {
+                    let mime = audio.info.as_ref().and_then(|i| i.mimetype.clone());
+                    (audio.source.clone(), mime)
+                }
+                _ => return Err("event n'est pas un m.audio".into()),
+            },
+            _ => return Err("event sans contenu décryptable".into()),
+        },
+        _ => return Err("event inattendu".into()),
+    };
+
+    let request = MediaRequest {
+        source,
+        format: MediaFormat::File,
+    };
+    let bytes = client.media().get_media_content(&request, true).await?;
+    Ok((bytes, mime))
+}
+
+/// Fallback path: write the bytes to a temp file and spawn the OS audio
+/// player. Used when in-process decoding fails (common case: Opus).
+fn save_and_open(
+    bytes: &[u8],
+    event_id: &str,
+    ext: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let safe_id: String = event_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = std::env::temp_dir().join(format!("matcurses-voice-{safe_id}.{ext}"));
+    std::fs::write(&path, bytes)?;
+
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+    #[cfg(target_os = "windows")]
+    let opener = "cmd";
+
+    #[cfg(target_os = "windows")]
+    std::process::Command::new(opener)
+        .args(["/C", "start", "", path.to_str().unwrap_or("")])
+        .spawn()?;
+    #[cfg(not(target_os = "windows"))]
+    std::process::Command::new(opener).arg(&path).spawn()?;
+
+    Ok(path)
+}
+
+fn ext_for_mime(mime: Option<&str>) -> &'static str {
+    match mime {
+        Some(m) if m.contains("ogg") => "ogg",
+        Some(m) if m.contains("opus") => "opus",
+        Some(m) if m.contains("mpeg") || m.contains("mp3") => "mp3",
+        Some(m) if m.contains("mp4") || m.contains("aac") || m.contains("m4a") => "m4a",
+        Some(m) if m.contains("wav") => "wav",
+        Some(m) if m.contains("flac") => "flac",
+        Some(m) if m.contains("webm") => "webm",
+        _ => "ogg",
     }
 }
 
