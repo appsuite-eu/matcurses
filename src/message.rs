@@ -10,6 +10,9 @@ pub enum Block {
 pub struct Reaction {
     pub key: String,
     pub users: Vec<String>,
+    /// Event id of MY reaction with this key, if I sent one. Used to redact
+    /// my own reaction (the toggle-off path).
+    pub my_event_id: Option<String>,
 }
 
 pub struct ThreadReply {

@@ -1,8 +1,6 @@
 use crate::event::{handle_key, EventOutcome};
 use crate::matrix::{Command as MxCommand, MatrixBridge, Update as MxUpdate};
-use crate::message::{
-    build_visible_items, Block, ItemKind, Message, Reaction, ViewItem,
-};
+use crate::message::{build_visible_items, Block, ItemKind, Message, ViewItem};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,22 +431,39 @@ impl App {
         if msg_idx >= self.messages.len() {
             return;
         }
-        let me = self.me.clone();
-        let msg = &mut self.messages[msg_idx];
-        if let Some(r) = msg.reactions.iter_mut().find(|r| r.key == key) {
-            if let Some(pos) = r.users.iter().position(|u| u == &me) {
-                r.users.remove(pos);
-            } else {
-                r.users.push(me.clone());
+        let parent_event_id = self.messages[msg_idx].event_id.clone();
+        let my_existing = self.messages[msg_idx]
+            .reactions
+            .iter()
+            .find(|r| r.key == key)
+            .and_then(|r| r.my_event_id.clone());
+
+        match (
+            self.matrix_logged_in,
+            self.matrix.as_ref(),
+            self.current_room_id.clone(),
+            parent_event_id.is_empty(),
+        ) {
+            (true, Some(b), Some(room_id), false) => {
+                if let Some(reaction_event_id) = my_existing {
+                    b.send(MxCommand::RedactEvent {
+                        room_id,
+                        event_id: reaction_event_id,
+                    });
+                    self.flash = Some(format!("réaction {} retirée", key));
+                } else {
+                    b.send(MxCommand::SendReaction {
+                        room_id,
+                        parent_event_id,
+                        key: key.clone(),
+                    });
+                    self.flash = Some(format!("réaction {} envoyée", key));
+                }
             }
-        } else {
-            msg.reactions.push(Reaction {
-                key: key.clone(),
-                users: vec![me],
-            });
+            _ => {
+                self.flash = Some("réactions indisponibles (hors session)".into());
+            }
         }
-        msg.reactions.retain(|r| !r.users.is_empty());
-        self.flash = Some(format!("réaction {} basculée", key));
     }
 
     pub fn play_current_voice(&mut self) {

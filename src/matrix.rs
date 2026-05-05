@@ -58,6 +58,15 @@ pub enum Command {
     PlayVoice { room_id: String, event_id: String },
     /// Stop the currently-playing voice note, if any.
     StopVoice,
+    /// Send an `m.reaction` to a parent event in a room.
+    SendReaction {
+        room_id: String,
+        parent_event_id: String,
+        key: String,
+    },
+    /// Redact (delete) an event we own — typically used to toggle off a
+    /// reaction we previously sent.
+    RedactEvent { room_id: String, event_id: String },
 }
 
 /// Updates pushed from the Matrix task to the UI.
@@ -436,6 +445,54 @@ async fn matrix_main(
             }
             Command::StopVoice => {
                 let _ = audio_tx.send(AudioCommand::Stop);
+            }
+            Command::SendReaction {
+                room_id,
+                parent_event_id,
+                key,
+            } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match send_reaction(&c, &room_id, &parent_event_id, &key).await {
+                            Ok(()) => {
+                                // Brief delay then refetch so the new reaction
+                                // shows up in the timeline.
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                let _ = load_room_messages(&c, &room_id, &tx).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("envoi réaction : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::RedactEvent { room_id, event_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match redact_event(&c, &room_id, &event_id).await {
+                            Ok(()) => {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                let _ = load_room_messages(&c, &room_id, &tx).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("suppression : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
             }
             Command::LoadSpaces => {
                 if let Some(c) = &client {
@@ -987,41 +1044,113 @@ async fn load_room_messages(
     // would strip them before we get a chance.
 
     let chunk = room.messages(opts).await?;
+    let me = client
+        .user_id()
+        .map(|u| u.to_string())
+        .unwrap_or_default();
 
-    let mut out = Vec::new();
-    for tev in chunk.chunk.iter().rev() {
-        let raw = tev.event.deserialize();
-        let raw = match raw {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        use matrix_sdk::ruma::events::AnyTimelineEvent;
+    use matrix_sdk::ruma::events::AnyTimelineEvent;
+    use std::collections::HashMap;
+
+    // Walk events in chronological (oldest → newest) order.
+    let events: Vec<AnyTimelineEvent> = chunk
+        .chunk
+        .iter()
+        .rev()
+        .filter_map(|tev| tev.event.deserialize().ok())
+        .collect();
+
+    // Pass 1: extract top-level RoomMessages and undecryptable placeholders.
+    // Skip thread replies, they are attached to their root in pass 2.
+    let mut out: Vec<Message> = Vec::new();
+    let mut idx_by_event: HashMap<String, usize> = HashMap::new();
+
+    for raw in &events {
         if let AnyTimelineEvent::MessageLike(ml) = raw {
             let event_id = ml.event_id().to_string();
+            let sender = ml.sender().to_string();
+            let ts = ml.origin_server_ts();
             match ml.original_content() {
                 Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => {
-                    let sender = ml.sender().to_string();
-                    let ts = ml.origin_server_ts();
+                    if matches!(
+                        &rmc.relates_to,
+                        Some(matrix_sdk::ruma::events::room::message::Relation::Thread(_))
+                    ) {
+                        continue;
+                    }
                     let msg = event_content_to_message(
                         &event_id,
                         &sender,
                         &rmc.msgtype,
                         ts.0.into(),
                     );
+                    idx_by_event.insert(event_id.clone(), out.len());
                     out.push(msg);
                 }
                 Some(AnyMessageLikeEventContent::RoomEncrypted(_)) => {
-                    // Decryption failed (likely missing Megolm session key).
-                    let sender = ml.sender().to_string();
-                    let ts = ml.origin_server_ts();
-                    out.push(Message {
+                    let m = Message {
                         time: format_time(ts.0.into()),
                         author: short_author(&sender),
                         blocks: vec![Block::Text("[chiffré · clé manquante]".into())],
                         replies: Vec::new(),
                         reactions: Vec::new(),
-                        event_id,
-                    });
+                        event_id: event_id.clone(),
+                    };
+                    idx_by_event.insert(event_id.clone(), out.len());
+                    out.push(m);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 2: attach thread replies and reactions to their parent message.
+    for raw in &events {
+        if let AnyTimelineEvent::MessageLike(ml) = raw {
+            let event_id = ml.event_id().to_string();
+            let sender = ml.sender().to_string();
+            let ts = ml.origin_server_ts();
+            match ml.original_content() {
+                Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => {
+                    if let Some(matrix_sdk::ruma::events::room::message::Relation::Thread(t)) =
+                        &rmc.relates_to
+                    {
+                        let root = t.event_id.to_string();
+                        if let Some(&idx) = idx_by_event.get(&root) {
+                            let reply = crate::message::ThreadReply {
+                                time: format_time(ts.0.into()),
+                                author: short_author(&sender),
+                                blocks: msgtype_to_blocks(&rmc.msgtype),
+                                event_id,
+                            };
+                            out[idx].replies.push(reply);
+                        }
+                    }
+                }
+                Some(AnyMessageLikeEventContent::Reaction(rc)) => {
+                    let parent = rc.relates_to.event_id.to_string();
+                    let key = rc.relates_to.key.clone();
+                    if let Some(&idx) = idx_by_event.get(&parent) {
+                        let display = short_author(&sender);
+                        let is_me = sender == me;
+                        let parent_msg = &mut out[idx];
+                        if let Some(r) =
+                            parent_msg.reactions.iter_mut().find(|r| r.key == key)
+                        {
+                            if !r.users.contains(&display) {
+                                r.users.push(display);
+                            }
+                            if is_me {
+                                r.my_event_id = Some(event_id.clone());
+                            }
+                        } else {
+                            parent_msg.reactions.push(crate::message::Reaction {
+                                key,
+                                users: vec![display],
+                                my_event_id: if is_me { Some(event_id.clone()) } else { None },
+                            });
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1034,6 +1163,34 @@ async fn load_room_messages(
             messages: out,
         })
         .await;
+    Ok(())
+}
+
+async fn send_reaction(
+    client: &Client,
+    room_id: &str,
+    parent_event_id: &str,
+    key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+    use matrix_sdk::ruma::events::relation::Annotation;
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    let parsed_event: OwnedEventId = parent_event_id.parse()?;
+    let content = ReactionEventContent::new(Annotation::new(parsed_event, key.to_string()));
+    room.send(content).await?;
+    Ok(())
+}
+
+async fn redact_event(
+    client: &Client,
+    room_id: &str,
+    event_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    let parsed_event: OwnedEventId = event_id.parse()?;
+    room.redact(&parsed_event, None, None).await?;
     Ok(())
 }
 
