@@ -122,14 +122,14 @@ pub struct App {
     pub me: String,
     pub flash: Option<String>,
     pub search: SearchState,
-    /// Pont vers le SDK Matrix. None si le runtime tokio n'a pas pu démarrer.
+    /// Bridge to the Matrix SDK. None if the tokio runtime failed to start.
     pub matrix: Option<MatrixBridge>,
-    /// IDs Matrix des rooms, alignés avec `room_list_state.rooms` (même longueur,
-    /// même ordre). Vide tant qu'on n'a pas reçu de `Update::Rooms`.
+    /// Matrix room IDs, aligned with `room_list_state.rooms` (same length,
+    /// same order). Empty until we receive an `Update::Rooms`.
     pub room_ids: Vec<String>,
-    /// Room ID actuellement ouverte côté Matrix (None tant qu'on est sur les mocks).
+    /// Room ID currently open on the Matrix side (None while on mocks).
     pub current_room_id: Option<String>,
-    /// True une fois le login Matrix confirmé.
+    /// True once the Matrix login is confirmed.
     pub matrix_logged_in: bool,
 }
 
@@ -166,6 +166,11 @@ impl App {
             current_room_id: None,
             matrix_logged_in: false,
         };
+        // Try to restore a previously-persisted session on startup, so the
+        // user doesn't have to log in again every time.
+        if let Some(b) = &s.matrix {
+            b.send(MxCommand::TryRestore);
+        }
         s.update_status();
         s
     }
@@ -183,7 +188,7 @@ impl App {
             } else {
                 self.tick();
             }
-            // Récupère et applique les updates Matrix en attente.
+            // Fetch and apply pending Matrix updates.
             self.apply_matrix_updates();
         }
         Ok(())
@@ -198,7 +203,7 @@ impl App {
                 self.search.timeout - elapsed
             }
         } else if self.matrix.is_some() {
-            // Sondage régulier pour récupérer les updates Matrix sans bloquer trop longtemps.
+            // Regular polling to fetch Matrix updates without blocking too long.
             Duration::from_millis(150)
         } else {
             Duration::from_secs(60)
@@ -513,7 +518,7 @@ impl App {
 
     pub fn switch_room(&mut self, name: &str) {
         self.current_room = name.to_string();
-        // Si Matrix est connecté, on récupère l'id correspondant et on déclenche le load.
+        // If Matrix is connected, fetch the matching id and trigger the load.
         if self.matrix_logged_in {
             let idx = self
                 .room_list_state
@@ -540,7 +545,7 @@ impl App {
         self.update_status();
     }
 
-    /// Lance le login Matrix avec les valeurs courantes du formulaire.
+    /// Starts the Matrix login with the current form values.
     pub fn submit_login(&mut self) {
         let (mxid, password, server) = {
             let s = &self.login_state;
@@ -571,7 +576,7 @@ impl App {
         self.flash = Some("connexion en cours…".into());
     }
 
-    /// Envoie le contenu du buffer de saisie dans la room courante (si Matrix actif).
+    /// Sends the input buffer contents to the current room (if Matrix is active).
     pub fn submit_input(&mut self) {
         if self.input.is_empty() {
             return;
@@ -587,12 +592,12 @@ impl App {
                 return;
             }
         }
-        // Fallback : on vide juste le buffer (comportement mock historique).
+        // Fallback: just empty the buffer (historical mock behavior).
         self.input.clear();
     }
 
-    /// Récupère et applique les updates Matrix en attente. Appelé à chaque
-    /// tour de boucle UI.
+    /// Fetches and applies pending Matrix updates. Called on each
+    /// UI loop iteration.
     pub fn apply_matrix_updates(&mut self) {
         let updates = match self.matrix.as_mut() {
             Some(b) => b.drain_updates(),
@@ -608,7 +613,7 @@ impl App {
             MxUpdate::LoggedIn { mxid } => {
                 self.matrix_logged_in = true;
                 self.flash = Some(format!("connecté · {}", mxid));
-                // Retour à la conversation si on était sur Login.
+                // Return to the conversation if we were on Login.
                 if matches!(self.view, View::Login) {
                     self.view = View::Conversation;
                     self.update_status();
@@ -619,11 +624,11 @@ impl App {
                 self.flash = Some(format!("login KO : {}", reason));
             }
             MxUpdate::Rooms { rooms, ids } => {
-                // Préserver la sélection si possible (par nom).
+                // Preserve the selection if possible (by name).
                 let prev_name = self.room_list_state.selected_room_name();
                 self.room_list_state.rooms = rooms;
                 self.room_ids = ids;
-                // Tri couplé rooms+ids (garde l'alignement nom↔id).
+                // Coupled sort of rooms+ids (preserves the name↔id alignment).
                 let mut combined: Vec<(crate::view::room_list::Room, String)> = self
                     .room_list_state
                     .rooms
@@ -682,11 +687,11 @@ impl App {
                 self.flash = Some(reason);
             }
             MxUpdate::SyncComplete => {
-                // rien à faire pour l'instant — on a déjà reçu Rooms juste avant.
+                // Nothing to do for now — we already received Rooms just before.
             }
             MxUpdate::Members { room_id, members } => {
-                // On accepte la mise à jour seulement si elle correspond à la
-                // room actuellement affichée dans la vue Members.
+                // Only accept the update if it matches the room
+                // currently displayed in the Members view.
                 if self.current_room_id.as_deref() == Some(&room_id) {
                     self.members_state.members = members;
                     self.members_state.set_selected(0);
@@ -762,7 +767,7 @@ impl App {
         self.search.query.pop();
         self.search.last_activity = Instant::now();
         if self.search.query.is_empty() {
-            // Empty query : pas de matches, curseur revient à la position d'origine
+            // Empty query: no matches, cursor returns to the origin position
             self.search.matches.clear();
             self.search.match_pos = 0;
             if let Some(origin) = self.search.origin.clone() {
@@ -1155,7 +1160,7 @@ fn mock_messages_with_extras() -> Vec<Message> {
     // Voice notes
     messages.insert(5, Message::voice("09:04", "carol", 28));
     messages.push(Message::voice("10:06", "dave", 73));
-    // Reactions sur quelques messages
+    // Reactions on a few messages
     let alice_postmortem_idx = messages
         .iter()
         .position(|m| m.author == "alice" && m.time == "10:02")

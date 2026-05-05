@@ -20,6 +20,6 @@ pub fn render_radio(frame: &mut Frame, area: Rect, r: &Radio) -> (u16, u16) {
         Style::default()
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
-    // Curseur entre les parenthèses : juste après "("
+    // Cursor between the parens, right after "(".
     (area.x + 1, area.y)
 }

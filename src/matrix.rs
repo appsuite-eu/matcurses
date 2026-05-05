@@ -1,16 +1,17 @@
-//! Pont entre l'UI synchrone (boucle crossterm) et le SDK Matrix asynchrone.
+//! Bridge between the synchronous UI (crossterm loop) and the async Matrix SDK.
 //!
-//! Le `MatrixBridge` détient un runtime tokio en arrière-plan, deux channels
-//! `mpsc` (UI → bg = Command, bg → UI = Update) et fait tourner une tâche
-//! qui pilote `matrix_sdk::Client` (login, sync, send, etc.).
+//! The `MatrixBridge` holds a tokio runtime in the background, two `mpsc`
+//! channels (UI → bg = Command, bg → UI = Update) and runs a task that
+//! drives `matrix_sdk::Client` (login, sync, send, etc.).
 //!
-//! Le crate `widgets/` ne dépend pas de ce module — c'est `app.rs` qui se
-//! charge de mapper les Updates vers l'état UI.
+//! The `widgets/` crate does not depend on this module — `app.rs` is in
+//! charge of mapping Updates to UI state.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use matrix_sdk::matrix_auth::MatrixSession;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::{MessagesOptions, RoomMember};
 use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
@@ -28,67 +29,70 @@ use crate::view::members::{Member as UiMember, Presence as UiPresence};
 use crate::view::room_list::Room as UiRoom;
 use crate::view::space_tree::{Node as UiNode, NodeKind as UiNodeKind};
 
-/// Commandes envoyées de l'UI vers la tâche Matrix.
+/// Commands sent from the UI to the Matrix task.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Login password : MXID + password + serveur (peut être vide → autodiscover via MXID)
+    /// Password login: MXID + password + server (may be empty → autodiscover via MXID)
     Login {
         mxid: String,
         password: String,
         server: String,
     },
-    /// L'utilisateur a sélectionné une room dans la liste — charger son contenu.
+    /// The user selected a room in the list — load its contents.
     OpenRoom { room_id: String },
-    /// Envoyer un message texte dans la room active (l'utilisateur a tapé Entrée).
+    /// Send a text message to the active room (user pressed Enter).
     SendMessage { room_id: String, body: String },
-    /// Forcer un refresh de la liste des rooms.
+    /// Force a refresh of the rooms list.
     #[allow(dead_code)]
     RefreshRooms,
-    /// Charger les membres joinés d'une room.
+    /// Load joined members of a room.
     LoadMembers { room_id: String },
-    /// Charger l'arbre des spaces (top-level + leurs enfants).
+    /// Load the spaces tree (top-level + their children).
     LoadSpaces,
+    /// Try to restore a previous session from the SQLite store.
+    /// On success → Update::LoggedIn + continuous sync. Otherwise → silence.
+    TryRestore,
 }
 
-/// Mises à jour poussées par la tâche Matrix vers l'UI.
+/// Updates pushed from the Matrix task to the UI.
 pub enum Update {
-    /// Login OK : MXID effectif (en cas d'autodiscovery).
+    /// Login OK: effective MXID (in case of autodiscovery).
     LoggedIn { mxid: String },
-    /// Login KO : message d'erreur lisible.
+    /// Login failed: human-readable error message.
     LoginFailed { reason: String },
-    /// Liste de rooms mise à jour (sync ou refresh manuel).
+    /// Rooms list updated (sync or manual refresh).
     Rooms {
         rooms: Vec<UiRoom>,
         ids: Vec<String>,
     },
-    /// Historique d'une room chargé / rafraîchi.
+    /// Room history loaded / refreshed.
     RoomMessages {
         room_id: String,
         messages: Vec<Message>,
     },
-    /// Nouvel event arrivé sur une room (pendant un sync live).
+    /// New event received on a room (during live sync).
     NewMessage {
         room_id: String,
         message: Message,
     },
-    /// Message d'erreur générique (sync, send, etc.) — à afficher en flash.
+    /// Generic error message (sync, send, etc.) — to display as flash.
     Error { reason: String },
-    /// Sync initial terminé.
+    /// Initial sync complete.
     SyncComplete,
-    /// Membres d'une room (en réponse à LoadMembers).
+    /// Members of a room (in response to LoadMembers).
     Members {
         room_id: String,
         members: Vec<UiMember>,
     },
-    /// Arbre des spaces (en réponse à LoadSpaces).
+    /// Spaces tree (in response to LoadSpaces).
     Spaces { roots: Vec<UiNode> },
 }
 
-/// Pont côté UI. Détient les sender/receiver et le runtime tokio.
+/// UI-side bridge. Owns the sender/receiver and the tokio runtime.
 pub struct MatrixBridge {
     pub cmd_tx: Sender<Command>,
     update_rx: Receiver<Update>,
-    /// Le runtime est gardé vivant tant que le bridge existe.
+    /// The runtime is kept alive as long as the bridge exists.
     _runtime: Runtime,
 }
 
@@ -110,16 +114,16 @@ impl MatrixBridge {
         })
     }
 
-    /// Envoi non-bloquant d'une commande. Si le channel est plein, on log et on jette.
+    /// Non-blocking command send. If the channel is full, we log and drop it.
     pub fn send(&self, cmd: Command) {
         if let Err(e) = self.cmd_tx.try_send(cmd) {
-            // Pas de log proper ici, on ne veut pas casser l'UI.
-            // La commande perdue est généralement bénigne (refresh).
+            // No proper log here — we don't want to break the UI.
+            // A dropped command is usually benign (refresh).
             let _ = e;
         }
     }
 
-    /// Drain des updates en attente, sans bloquer.
+    /// Drain pending updates without blocking.
     pub fn drain_updates(&mut self) -> Vec<Update> {
         let mut out = Vec::new();
         while let Ok(u) = self.update_rx.try_recv() {
@@ -129,7 +133,7 @@ impl MatrixBridge {
     }
 }
 
-/// Boucle principale de la tâche Matrix : reçoit des commandes, gère le client.
+/// Main loop of the Matrix task: receives commands, drives the client.
 async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
     let mut client: Option<Arc<Client>> = None;
 
@@ -142,13 +146,31 @@ async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
             } => {
                 match do_login(&mxid, &password, &server).await {
                     Ok(c) => {
+                        // Persist MXID + serialized session so we can auto-restore.
+                        let normalized_mxid = if mxid.starts_with('@') {
+                            mxid.clone()
+                        } else {
+                            format!("@{mxid}")
+                        };
+                        if let Ok(p) = last_mxid_file() {
+                            let _ = std::fs::write(&p, &normalized_mxid);
+                        }
+                        if let Some(session) = c.matrix_auth().session() {
+                            if let Ok(store_path) = session_store_path(&normalized_mxid) {
+                                if let Ok(json) = serde_json::to_string(&session) {
+                                    let _ = std::fs::write(store_path.join("session.json"), json);
+                                }
+                            }
+                        }
+
                         let arc = Arc::new(c);
                         client = Some(arc.clone());
                         let _ = update_tx
-                            .send(Update::LoggedIn { mxid: mxid.clone() })
+                            .send(Update::LoggedIn {
+                                mxid: normalized_mxid,
+                            })
                             .await;
 
-                        // Lancer un sync_once pour peupler les rooms, puis un sync continu.
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
                         tokio::spawn(async move {
@@ -159,6 +181,32 @@ async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
                         let _ = update_tx
                             .send(Update::LoginFailed {
                                 reason: format!("{e}"),
+                            })
+                            .await;
+                    }
+                }
+            }
+            Command::TryRestore => {
+                match try_restore_session().await {
+                    Ok(Some((c, mxid))) => {
+                        let arc = Arc::new(c);
+                        client = Some(arc.clone());
+                        let _ = update_tx.send(Update::LoggedIn { mxid }).await;
+
+                        let tx = update_tx.clone();
+                        let arc2 = arc.clone();
+                        tokio::spawn(async move {
+                            run_sync(arc2, tx).await;
+                        });
+                    }
+                    Ok(None) => {
+                        // No session: wait for a Command::Login. We don't push a flash
+                        // here to avoid polluting the UI on a normal cold start.
+                    }
+                    Err(e) => {
+                        let _ = update_tx
+                            .send(Update::Error {
+                                reason: format!("restore session : {e}"),
                             })
                             .await;
                     }
@@ -233,7 +281,88 @@ async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
     }
 }
 
-/// Charge les membres joinés d'une room et envoie un Update::Members.
+/// Try to restore a previously persisted session from the SQLite store.
+/// Returns `Some((client, mxid))` if a logged-in client was restored.
+async fn try_restore_session(
+) -> Result<Option<(Client, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    let last_mxid_path = match last_mxid_file() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if !last_mxid_path.exists() {
+        return Ok(None);
+    }
+    let mxid = std::fs::read_to_string(&last_mxid_path)?;
+    let mxid = mxid.trim().to_string();
+    if mxid.is_empty() {
+        return Ok(None);
+    }
+    let store_path = session_store_path(&mxid)?;
+    if !store_path.exists() {
+        return Ok(None);
+    }
+
+    let domain = mxid
+        .trim_start_matches('@')
+        .split(':')
+        .nth(1)
+        .ok_or("MXID invalide (pas de domaine)")?;
+    let server_name: matrix_sdk::ruma::OwnedServerName = domain.parse()?;
+
+    let session_path = store_path.join("session.json");
+    if !session_path.exists() {
+        return Ok(None);
+    }
+
+    match build_and_restore(&server_name, &store_path, &session_path).await {
+        Ok(client) => {
+            if client.matrix_auth().logged_in() {
+                Ok(Some((client, mxid)))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(e) if is_account_mismatch(e.as_ref()) => {
+            // Stale crypto store. Wipe and force the user back to the Login
+            // view by returning Ok(None).
+            let _ = std::fs::remove_dir_all(&store_path);
+            let _ = std::fs::remove_file(last_mxid_file()?);
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn build_and_restore(
+    server_name: &matrix_sdk::ruma::OwnedServerName,
+    store_path: &std::path::Path,
+    session_path: &std::path::Path,
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    let client = Client::builder()
+        .server_name(server_name)
+        .sqlite_store(store_path, None)
+        .build()
+        .await?;
+    let json = std::fs::read_to_string(session_path)?;
+    let session: MatrixSession = serde_json::from_str(&json)?;
+    client.matrix_auth().restore_session(session).await?;
+    Ok(client)
+}
+
+/// Path used to remember the last successfully-logged-in MXID, used by
+/// `try_restore_session` on next startup.
+fn last_mxid_file() -> std::io::Result<PathBuf> {
+    let base = dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no data directory")
+        })?;
+    let dir = base.join("matcurses");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("last_mxid"))
+}
+
+/// Load joined members of a room and emit `Update::Members`.
 async fn load_members(
     client: &Client,
     room_id: &str,
@@ -243,7 +372,7 @@ async fn load_members(
     let room = client.get_room(&parsed).ok_or("room introuvable")?;
     let members = room.members(RoomMemberships::JOIN).await?;
     let mut out: Vec<UiMember> = members.iter().map(map_member).collect();
-    // Tri : admin d'abord, puis modérateurs, puis alphabétique.
+    // Sort: admin first, then moderators, then alphabetical.
     out.sort_by(|a, b| {
         b.power_level
             .cmp(&a.power_level)
@@ -265,9 +394,9 @@ fn map_member(m: &RoomMember) -> UiMember {
         .map(|s| s.to_string())
         .unwrap_or_else(|| m.user_id().localpart().to_string());
     let power_level = m.power_level().clamp(0, 100) as u8;
-    // La presence n'est pas exposée directement sur RoomMember en matrix-sdk 0.7 :
-    // elle dépend d'une route séparée et n'est pas systématiquement remplie.
-    // On reste sur Unavailable par défaut ; on pourra brancher la presence API plus tard.
+    // Presence is not exposed directly on RoomMember in matrix-sdk 0.7:
+    // it depends on a separate API and isn't always populated. Default to
+    // Unavailable for now; we can wire the presence API later.
     let presence = UiPresence::Unavailable;
     UiMember {
         mxid,
@@ -277,8 +406,8 @@ fn map_member(m: &RoomMember) -> UiMember {
     }
 }
 
-/// Charge l'arbre des spaces : pour chaque space joinable, récupère ses
-/// enfants directs (m.space.child state events), récursif sur les sub-spaces.
+/// Load the spaces tree: for each joinable space, fetch its direct
+/// children (m.space.child state events), recursing into sub-spaces.
 async fn load_spaces(
     client: &Client,
     tx: &Sender<Update>,
@@ -286,9 +415,9 @@ async fn load_spaces(
     use std::collections::HashSet;
     let mut visited: HashSet<String> = HashSet::new();
     let mut roots = Vec::new();
-    // On considère comme racines tous les spaces joinables (matrix-sdk ne donne pas
-    // directement la notion de "top-level"; en pratique l'utilisateur peut joindre
-    // un sub-space directement, donc on liste tout et l'utilisateur trie).
+    // We treat every joinable space as a root: matrix-sdk doesn't expose a
+    // "top-level" notion, and in practice the user can join a sub-space
+    // directly, so we list them all and let the user sort it out.
     for r in client.rooms() {
         if !r.is_space() {
             continue;
@@ -300,7 +429,7 @@ async fn load_spaces(
         let node = build_space_node(client, &r, &mut visited).await;
         roots.push(node);
     }
-    // Les rooms hors de tout space restent accessibles via F4 (room list).
+    // Rooms that don't belong to any space remain accessible via F4 (room list).
     let _ = tx.send(Update::Spaces { roots }).await;
     Ok(())
 }
@@ -353,7 +482,7 @@ async fn collect_space_children(
             Ok(p) => p,
             Err(_) => continue,
         };
-        // state_key est l'ID de la room enfant
+        // state_key is the child room ID
         let child_id_str = parsed.state_key().to_string();
         if visited.contains(&child_id_str) {
             continue;
@@ -389,7 +518,11 @@ async fn collect_space_children(
     out
 }
 
-/// Effectue le login + restore éventuel de session, retourne un Client connecté.
+/// Perform the login (and optional session restore), return a connected Client.
+///
+/// If the first attempt fails with a crypto-store account mismatch (a stale
+/// store from a previous login pointing to a now-defunct device), the store
+/// is wiped and the login is retried once with a clean store.
 async fn do_login(
     mxid: &str,
     password: &str,
@@ -398,14 +531,31 @@ async fn do_login(
     if mxid.is_empty() || password.is_empty() {
         return Err("MXID ou mot de passe vide".into());
     }
+    match login_once(mxid, password, server).await {
+        Ok(c) => Ok(c),
+        Err(e) if is_account_mismatch(e.as_ref()) => {
+            // Stale crypto store: wipe and retry once with a clean store.
+            let store_path = session_store_path(mxid)?;
+            let _ = std::fs::remove_dir_all(&store_path);
+            login_once(mxid, password, server).await
+        }
+        Err(e) => Err(e),
+    }
+}
 
+/// Single login attempt with the existing (or freshly created) store.
+async fn login_once(
+    mxid: &str,
+    password: &str,
+    server: &str,
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     let store_path = session_store_path(mxid)?;
     std::fs::create_dir_all(&store_path)?;
 
-    // Si l'utilisateur a fourni une URL explicite, on l'utilise telle quelle.
-    // Sinon (champ vide ou simple domaine), on passe par `server_name` qui
-    // déclenche l'auto-discovery .well-known/matrix/client — plus robuste pour
-    // les Synapse qui sont derrière un reverse proxy.
+    // If the user provided an explicit URL, use it as is. Otherwise (empty
+    // field or bare domain) we go through `server_name`, which triggers
+    // .well-known/matrix/client autodiscovery — more robust for Synapse
+    // instances sitting behind a reverse proxy.
     let server_input = if server.is_empty() {
         mxid.trim_start_matches('@')
             .split(':')
@@ -435,9 +585,9 @@ async fn do_login(
             .map_err(|e| format!("auto-discovery {server_name} : {e}"))?
     };
 
-    // Le MXID complet (avec @ si fourni sans, on le préfixe). login_username
-    // accepte localpart ou MXID complet — passer le MXID complet est le plus
-    // explicite côté serveur.
+    // The full MXID (we prepend @ if the user omitted it). `login_username`
+    // accepts either a localpart or a full MXID — passing the full MXID is
+    // the most explicit choice server-side.
     let user_id = if mxid.starts_with('@') {
         mxid.to_string()
     } else {
@@ -453,6 +603,26 @@ async fn do_login(
         .map_err(|e| format!("auth user_id={user_id} : {e}"))?;
 
     Ok(client)
+}
+
+/// Detect the matrix-sdk crypto store error that indicates the store was
+/// created for a different account (stale device after server-side logout
+/// or device deletion). Pattern-matches the formatted error message — not
+/// pretty, but matrix-sdk doesn't expose a typed variant we can match on
+/// portably across error chains.
+fn is_account_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let s = e.to_string().to_lowercase();
+        if s.contains("account in the store doesn't match")
+            || s.contains("account in the store does not match")
+            || s.contains("the account in the store")
+        {
+            return true;
+        }
+        current = e.source();
+    }
+    false
 }
 
 /// Path: ~/.local/share/matcurses/<account_sanitized>/
@@ -475,7 +645,7 @@ fn session_store_path(mxid: &str) -> std::io::Result<PathBuf> {
     Ok(base.join("matcurses").join(safe))
 }
 
-/// Lance le sync continu et pousse des updates Rooms à chaque tick.
+/// Run the continuous sync and push Rooms updates on every tick.
 async fn run_sync(client: Arc<Client>, tx: Sender<Update>) {
     // Handler pour live messages.
     let tx_handler = tx.clone();
@@ -515,8 +685,22 @@ async fn run_sync(client: Arc<Client>, tx: Sender<Update>) {
     let _ = tx.send(snapshot_rooms(&client).await).await;
     let _ = tx.send(Update::SyncComplete).await;
 
-    // Sync continu.
-    if let Err(e) = client.sync(settings).await {
+    // Continuous sync: push a rooms snapshot after each iteration so the UI
+    // reflects new rooms in real time (including those created by bridges
+    // like mautrix-whatsapp), unread count changes, name changes, etc.
+    let tx_cb = tx.clone();
+    let client_cb = client.clone();
+    let result = client
+        .sync_with_callback(settings, move |_response| {
+            let tx = tx_cb.clone();
+            let c = client_cb.clone();
+            async move {
+                let _ = tx.send(snapshot_rooms(&c).await).await;
+                matrix_sdk::LoopCtrl::Continue
+            }
+        })
+        .await;
+    if let Err(e) = result {
         let _ = tx
             .send(Update::Error {
                 reason: format!("sync : {e}"),
@@ -525,7 +709,7 @@ async fn run_sync(client: Arc<Client>, tx: Sender<Update>) {
     }
 }
 
-/// Snapshot synchrone (côté tokio) des rooms.
+/// Synchronous rooms snapshot (run on the tokio side).
 async fn snapshot_rooms(client: &Client) -> Update {
     let mut rooms = Vec::new();
     let mut ids = Vec::new();
@@ -553,7 +737,7 @@ async fn snapshot_rooms(client: &Client) -> Update {
     Update::Rooms { rooms, ids }
 }
 
-/// Charge ~50 derniers messages d'une room et envoie un Update::RoomMessages.
+/// Load the ~50 latest messages of a room and emit an `Update::RoomMessages`.
 async fn load_room_messages(
     client: &Client,
     room_id: &str,
@@ -603,7 +787,7 @@ async fn load_room_messages(
     Ok(())
 }
 
-/// Envoie un message texte plain dans la room.
+/// Send a plain text message into the room.
 async fn do_send(
     client: &Client,
     room_id: &str,
@@ -636,7 +820,7 @@ fn msgtype_to_blocks(msgtype: &MessageType) -> Vec<Block> {
     match msgtype {
         MessageType::Text(t) => {
             // Heuristique : si le formatted body contient <pre><code> ou si le body
-            // est entouré de ```, on considère que c'est du code.
+            // is wrapped in ```, treat it as a code block.
             let body = t.body.clone();
             if let Some(stripped) = body.strip_prefix("```").and_then(|b| b.strip_suffix("```")) {
                 vec![Block::Code(stripped.trim().to_string())]
@@ -650,7 +834,7 @@ fn msgtype_to_blocks(msgtype: &MessageType) -> Vec<Block> {
         MessageType::Notice(n) => vec![Block::Text(n.body.clone())],
         MessageType::Emote(e) => vec![Block::Text(format!("* {}", e.body))],
         MessageType::Audio(a) => {
-            // Voice notes : durée si dispo, sinon 0
+            // Voice notes: duration if available, else 0.
             let secs = a
                 .info
                 .as_ref()
@@ -669,11 +853,11 @@ fn msgtype_to_blocks(msgtype: &MessageType) -> Vec<Block> {
 }
 
 fn format_time(ts_ms: u64) -> String {
-    // ts_ms = millisecondes Unix. On formatte en HH:MM local.
+    // ts_ms = Unix milliseconds. Format as local HH:MM.
     use std::time::{SystemTime, UNIX_EPOCH};
-    let _ = (SystemTime::now(), UNIX_EPOCH); // évite warning si non utilisé
+    let _ = (SystemTime::now(), UNIX_EPOCH); // avoid unused-import warning
     let secs = ts_ms / 1000;
-    // Calcul minimaliste (pas de chrono pour rester light) : HH:MM UTC.
+    // Minimal computation (no chrono dep, stay light): HH:MM UTC.
     let total_min = secs / 60;
     let h = (total_min / 60) % 24;
     let m = total_min % 60;

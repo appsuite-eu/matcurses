@@ -20,6 +20,6 @@ pub fn render_checkbox(frame: &mut Frame, area: Rect, c: &Checkbox) -> (u16, u16
         Style::default()
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
-    // Curseur entre les crochets : juste après "["
+    // Cursor between the brackets, right after "[".
     (area.x + 1, area.y)
 }

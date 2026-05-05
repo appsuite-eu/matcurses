@@ -1,22 +1,21 @@
-//! Widgets primitifs réutilisables pour TUI braille-friendly.
+//! Reusable widget primitives for braille-friendly TUIs.
 //!
-//! Conventions de placement du curseur sur les widgets interactifs.
-//! Le curseur logique est ce que suit l'afficheur braille / le screen reader.
+//! Cursor placement conventions for interactive widgets.
+//! The logical cursor is what the braille display / screen reader follows.
 //!
-//! - Bouton    `[ Oui ]`     → première lettre du label (`O`)
-//! - Checkbox  `[x] Label`   → entre les crochets (sur le `x` ou l'espace)
-//! - Radio     `(x) Label`   → entre les parenthèses (sur le `x` ou l'espace)
-//! - Lien      `Cliquez ici` → premier caractère du texte cliquable
-//! - TextInput `Label: …`    → fin de la valeur saisie
-//! - List/Tree ligne courante → colonne demandée par la row, ou position du
-//!                              match si une `search_query` est fournie
+//! - Button    `[ Yes ]`     → first letter of the label (`Y`)
+//! - Checkbox  `[x] Label`   → between the brackets (on the `x` or the space)
+//! - Radio     `(x) Label`   → between the parens (on the `x` or the space)
+//! - Link      `Click here`  → first character of the clickable text
+//! - TextInput `Label: …`    → end of the entered value
+//! - List/Tree current row   → column requested by the row, or position of the
+//!                             match if a `search_query` is provided
 //!
-//! Les vues métier sont des assemblages de ces primitifs : un dialogue de
-//! login = un `Form` avec quelques `Text` + `Button`, une room list = un
-//! `List` avec des `ListRow` formatées, un space tree = un `Tree` avec des
-//! `TreeRow`. Le crate ne connaît rien du domaine applicatif (pas de
-//! Matrix, pas de message, pas de room) — il ne rend que des éléments
-//! d'interface.
+//! Domain views are assemblies of these primitives: a login dialog = a `Form`
+//! with a few `Text` + `Button`s, a room list = a `List` of formatted
+//! `ListRow`s, a space tree = a `Tree` of `TreeRow`s. The crate knows
+//! nothing about the application domain (no Matrix, no message, no room) —
+//! it only renders UI elements.
 
 pub mod button;
 pub mod checkbox;

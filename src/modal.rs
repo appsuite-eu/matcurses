@@ -1,6 +1,6 @@
-// Conventions du curseur logique : voir le crate `widgets`.
-// Les modales utilisent ces conventions pour placer le curseur sur l'élément
-// focusé et propager la position via `ModalCursor`.
+// Cursor convention: see the `widgets` crate.
+// Modals use these conventions to place the cursor on the focused element
+// and propagate the position via `ModalCursor`.
 
 use ratatui::{
     layout::Rect,

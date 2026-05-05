@@ -23,7 +23,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> EventOutcome {
     if app.search.active {
         return handle_search_key(app, key);
     }
-    // Ctrl+N / Ctrl+P : reprendre la dernière recherche même si fermée.
+    // Ctrl+N / Ctrl+P: resume the last search even if closed.
     if app.is_searchable_view()
         && !app.search.query.is_empty()
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -355,5 +355,5 @@ fn handle_login_key(app: &mut App, key: KeyEvent) -> EventOutcome {
 }
 
 fn handle_login_button(_app: &mut App, _key: KeyEvent) {
-    // Placeholder: les boutons réagissent à Enter dans l'arm Enter du match.
+    // Placeholder: buttons react to Enter in the Enter arm of the match.
 }

@@ -18,7 +18,7 @@ pub fn render_button(frame: &mut Frame, area: Rect, b: &Button) -> (u16, u16) {
         Style::default()
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
-    // Curseur sur la première lettre du label, après "[ "
+    // Cursor on the first letter of the label, just after "[ ".
     (area.x + 2, area.y)
 }
 

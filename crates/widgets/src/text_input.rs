@@ -27,7 +27,7 @@ pub fn render_text_input(frame: &mut Frame, area: Rect, t: &TextInput) -> (u16, 
         Style::default().add_modifier(Modifier::DIM)
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
-    // Curseur juste après la valeur saisie (en fin de saisie)
+    // Cursor right after the typed value (at the end of the input).
     let cursor_x = area.x + label_len + displayed.chars().count() as u16;
     let max_x = area.right().saturating_sub(1);
     (cursor_x.min(max_x), area.y)
