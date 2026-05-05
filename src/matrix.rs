@@ -92,6 +92,14 @@ pub enum Update {
     },
     /// Spaces tree (in response to LoadSpaces).
     Spaces { roots: Vec<UiNode> },
+    /// Presence update for a single member, scoped to the room it was
+    /// requested from. Fired after `LoadMembers` once each per-user
+    /// `GET /presence/{user}/status` response comes back.
+    MemberPresence {
+        room_id: String,
+        mxid: String,
+        presence: UiPresence,
+    },
 }
 
 /// Audio commands sent to the dedicated audio thread.
@@ -529,7 +537,9 @@ fn last_mxid_file() -> std::io::Result<PathBuf> {
     Ok(dir.join("last_mxid"))
 }
 
-/// Load joined members of a room and emit `Update::Members`.
+/// Load joined members of a room and emit `Update::Members`. Then spawn
+/// per-user presence fetches that emit `Update::MemberPresence` as their
+/// responses come back.
 async fn load_members(
     client: &Client,
     room_id: &str,
@@ -545,13 +555,56 @@ async fn load_members(
             .cmp(&a.power_level)
             .then_with(|| a.displayname.to_lowercase().cmp(&b.displayname.to_lowercase()))
     });
+    let mxids: Vec<String> = out.iter().map(|m| m.mxid.clone()).collect();
     let _ = tx
         .send(Update::Members {
             room_id: room_id.to_string(),
             members: out,
         })
         .await;
+
+    // Fetch presence per user in parallel; each result lands on the UI as a
+    // separate Update::MemberPresence so the list refreshes progressively.
+    for mxid in mxids {
+        let client = client.clone();
+        let tx = tx.clone();
+        let room_id = room_id.to_string();
+        tokio::spawn(async move {
+            if let Ok(presence) = fetch_presence(&client, &mxid).await {
+                let _ = tx
+                    .send(Update::MemberPresence {
+                        room_id,
+                        mxid,
+                        presence,
+                    })
+                    .await;
+            }
+        });
+    }
+
     Ok(())
+}
+
+async fn fetch_presence(
+    client: &Client,
+    mxid: &str,
+) -> Result<UiPresence, Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::api::client::presence::get_presence;
+    use matrix_sdk::ruma::OwnedUserId;
+    let user_id: OwnedUserId = mxid.parse()?;
+    let request = get_presence::v3::Request::new(user_id);
+    let response = client.send(request, None).await?;
+    Ok(map_presence(&response.presence))
+}
+
+fn map_presence(p: &matrix_sdk::ruma::presence::PresenceState) -> UiPresence {
+    use matrix_sdk::ruma::presence::PresenceState;
+    match p {
+        PresenceState::Online => UiPresence::Online,
+        PresenceState::Unavailable => UiPresence::Idle,
+        PresenceState::Offline => UiPresence::Offline,
+        _ => UiPresence::Unavailable,
+    }
 }
 
 fn map_member(m: &RoomMember) -> UiMember {

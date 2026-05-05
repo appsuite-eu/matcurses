@@ -743,6 +743,22 @@ impl App {
                     self.members_state.set_selected(0);
                 }
             }
+            MxUpdate::MemberPresence {
+                room_id,
+                mxid,
+                presence,
+            } => {
+                if self.current_room_id.as_deref() == Some(&room_id) {
+                    if let Some(m) = self
+                        .members_state
+                        .members
+                        .iter_mut()
+                        .find(|m| m.mxid == mxid)
+                    {
+                        m.presence = presence;
+                    }
+                }
+            }
             MxUpdate::Spaces { roots } => {
                 // Preserve user state across reloads: keep the currently
                 // selected path and re-expand any space that was open before.
