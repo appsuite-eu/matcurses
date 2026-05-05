@@ -12,19 +12,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::room::{MessagesOptions, RoomMember};
 use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
 };
 use matrix_sdk::ruma::events::AnyMessageLikeEventContent;
 use matrix_sdk::ruma::OwnedRoomId;
-use matrix_sdk::Client;
+use matrix_sdk::{Client, RoomMemberships};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::message::{Block, Message};
+use crate::view::members::{Member as UiMember, Presence as UiPresence};
 use crate::view::room_list::Room as UiRoom;
+use crate::view::space_tree::{Node as UiNode, NodeKind as UiNodeKind};
 
 /// Commandes envoyées de l'UI vers la tâche Matrix.
 #[derive(Debug, Clone)]
@@ -42,6 +44,10 @@ pub enum Command {
     /// Forcer un refresh de la liste des rooms.
     #[allow(dead_code)]
     RefreshRooms,
+    /// Charger les membres joinés d'une room.
+    LoadMembers { room_id: String },
+    /// Charger l'arbre des spaces (top-level + leurs enfants).
+    LoadSpaces,
 }
 
 /// Mises à jour poussées par la tâche Matrix vers l'UI.
@@ -69,6 +75,13 @@ pub enum Update {
     Error { reason: String },
     /// Sync initial terminé.
     SyncComplete,
+    /// Membres d'une room (en réponse à LoadMembers).
+    Members {
+        room_id: String,
+        members: Vec<UiMember>,
+    },
+    /// Arbre des spaces (en réponse à LoadSpaces).
+    Spaces { roots: Vec<UiNode> },
 }
 
 /// Pont côté UI. Détient les sender/receiver et le runtime tokio.
@@ -186,8 +199,194 @@ async fn matrix_main(mut cmd_rx: Receiver<Command>, update_tx: Sender<Update>) {
                     let _ = update_tx.send(snapshot_rooms(c).await).await;
                 }
             }
+            Command::LoadMembers { room_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = load_members(&c, &room_id, &tx).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("membres : {e}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::LoadSpaces => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = load_spaces(&c, &tx).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("spaces : {e}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
         }
     }
+}
+
+/// Charge les membres joinés d'une room et envoie un Update::Members.
+async fn load_members(
+    client: &Client,
+    room_id: &str,
+    tx: &Sender<Update>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("room introuvable")?;
+    let members = room.members(RoomMemberships::JOIN).await?;
+    let mut out: Vec<UiMember> = members.iter().map(map_member).collect();
+    // Tri : admin d'abord, puis modérateurs, puis alphabétique.
+    out.sort_by(|a, b| {
+        b.power_level
+            .cmp(&a.power_level)
+            .then_with(|| a.displayname.to_lowercase().cmp(&b.displayname.to_lowercase()))
+    });
+    let _ = tx
+        .send(Update::Members {
+            room_id: room_id.to_string(),
+            members: out,
+        })
+        .await;
+    Ok(())
+}
+
+fn map_member(m: &RoomMember) -> UiMember {
+    let mxid = m.user_id().to_string();
+    let displayname = m
+        .display_name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| m.user_id().localpart().to_string());
+    let power_level = m.power_level().clamp(0, 100) as u8;
+    // La presence n'est pas exposée directement sur RoomMember en matrix-sdk 0.7 :
+    // elle dépend d'une route séparée et n'est pas systématiquement remplie.
+    // On reste sur Unavailable par défaut ; on pourra brancher la presence API plus tard.
+    let presence = UiPresence::Unavailable;
+    UiMember {
+        mxid,
+        displayname,
+        power_level,
+        presence,
+    }
+}
+
+/// Charge l'arbre des spaces : pour chaque space joinable, récupère ses
+/// enfants directs (m.space.child state events), récursif sur les sub-spaces.
+async fn load_spaces(
+    client: &Client,
+    tx: &Sender<Update>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::HashSet;
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut roots = Vec::new();
+    // On considère comme racines tous les spaces joinables (matrix-sdk ne donne pas
+    // directement la notion de "top-level"; en pratique l'utilisateur peut joindre
+    // un sub-space directement, donc on liste tout et l'utilisateur trie).
+    for r in client.rooms() {
+        if !r.is_space() {
+            continue;
+        }
+        let space_id = r.room_id().to_string();
+        if visited.contains(&space_id) {
+            continue;
+        }
+        let node = build_space_node(client, &r, &mut visited).await;
+        roots.push(node);
+    }
+    // Les rooms hors de tout space restent accessibles via F4 (room list).
+    let _ = tx.send(Update::Spaces { roots }).await;
+    Ok(())
+}
+
+async fn build_space_node(
+    client: &Client,
+    space: &matrix_sdk::Room,
+    visited: &mut std::collections::HashSet<String>,
+) -> UiNode {
+    let space_id = space.room_id().to_string();
+    visited.insert(space_id.clone());
+
+    let label = space
+        .display_name()
+        .await
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| {
+            space
+                .name()
+                .unwrap_or_else(|| space.room_id().to_string())
+        });
+
+    let children = collect_space_children(client, space, visited).await;
+
+    UiNode {
+        label,
+        kind: UiNodeKind::Space {
+            expanded: false,
+            children,
+        },
+    }
+}
+
+async fn collect_space_children(
+    client: &Client,
+    space: &matrix_sdk::Room,
+    visited: &mut std::collections::HashSet<String>,
+) -> Vec<UiNode> {
+    use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+    let mut out = Vec::new();
+    let raw_events = match space
+        .get_state_events_static::<SpaceChildEventContent>()
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for raw in raw_events {
+        let parsed = match raw.deserialize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // state_key est l'ID de la room enfant
+        let child_id_str = parsed.state_key().to_string();
+        if visited.contains(&child_id_str) {
+            continue;
+        }
+        let child_id: OwnedRoomId = match child_id_str.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let child_room = match client.get_room(&child_id) {
+            Some(r) => r,
+            None => continue,
+        };
+        if child_room.is_space() {
+            let node = Box::pin(build_space_node(client, &child_room, visited)).await;
+            out.push(node);
+        } else {
+            visited.insert(child_id_str.clone());
+            let label = child_room
+                .display_name()
+                .await
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| child_id_str.clone());
+            let counts = child_room.unread_notification_counts();
+            out.push(UiNode {
+                label,
+                kind: UiNodeKind::Room {
+                    name: child_id_str,
+                    unread: counts.notification_count as usize,
+                },
+            });
+        }
+    }
+    out
 }
 
 /// Effectue le login + restore éventuel de session, retourne un Client connecté.
@@ -200,42 +399,58 @@ async fn do_login(
         return Err("MXID ou mot de passe vide".into());
     }
 
-    // Dériver le serveur si vide à partir du MXID (@user:server.tld)
-    let server_url = if server.is_empty() {
-        let domain = mxid
-            .trim_start_matches('@')
-            .split(':')
-            .nth(1)
-            .ok_or("MXID invalide (pas de domaine)")?;
-        format!("https://{domain}")
-    } else if server.starts_with("http://") || server.starts_with("https://") {
-        server.to_string()
-    } else {
-        format!("https://{server}")
-    };
-
     let store_path = session_store_path(mxid)?;
     std::fs::create_dir_all(&store_path)?;
 
-    let client = Client::builder()
-        .homeserver_url(&server_url)
-        .sqlite_store(&store_path, None)
-        .build()
-        .await?;
+    // Si l'utilisateur a fourni une URL explicite, on l'utilise telle quelle.
+    // Sinon (champ vide ou simple domaine), on passe par `server_name` qui
+    // déclenche l'auto-discovery .well-known/matrix/client — plus robuste pour
+    // les Synapse qui sont derrière un reverse proxy.
+    let server_input = if server.is_empty() {
+        mxid.trim_start_matches('@')
+            .split(':')
+            .nth(1)
+            .ok_or("MXID invalide (pas de domaine)")?
+            .to_string()
+    } else {
+        server.to_string()
+    };
 
-    // Username : on récupère la part avant le ':' du MXID, en strippant le @
-    let username = mxid
-        .trim_start_matches('@')
-        .split(':')
-        .next()
-        .unwrap_or(mxid);
+    let client = if server_input.starts_with("http://") || server_input.starts_with("https://") {
+        Client::builder()
+            .homeserver_url(&server_input)
+            .sqlite_store(&store_path, None)
+            .build()
+            .await
+            .map_err(|e| format!("connexion à {server_input} : {e}"))?
+    } else {
+        let server_name: matrix_sdk::ruma::OwnedServerName = server_input
+            .parse()
+            .map_err(|e| format!("nom de serveur invalide '{server_input}' : {e}"))?;
+        Client::builder()
+            .server_name(&server_name)
+            .sqlite_store(&store_path, None)
+            .build()
+            .await
+            .map_err(|e| format!("auto-discovery {server_name} : {e}"))?
+    };
+
+    // Le MXID complet (avec @ si fourni sans, on le préfixe). login_username
+    // accepte localpart ou MXID complet — passer le MXID complet est le plus
+    // explicite côté serveur.
+    let user_id = if mxid.starts_with('@') {
+        mxid.to_string()
+    } else {
+        format!("@{mxid}")
+    };
 
     client
         .matrix_auth()
-        .login_username(username, password)
+        .login_username(&user_id, password)
         .initial_device_display_name("matcurses")
         .send()
-        .await?;
+        .await
+        .map_err(|e| format!("auth user_id={user_id} : {e}"))?;
 
     Ok(client)
 }

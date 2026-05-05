@@ -492,11 +492,23 @@ impl App {
     pub fn open_spaces(&mut self) {
         self.view = View::SpaceTree;
         self.update_status();
+        if self.matrix_logged_in {
+            if let Some(b) = &self.matrix {
+                b.send(MxCommand::LoadSpaces);
+            }
+        }
     }
 
     pub fn open_members(&mut self) {
         self.view = View::Members;
         self.update_status();
+        if self.matrix_logged_in {
+            if let (Some(b), Some(rid)) = (&self.matrix, &self.current_room_id) {
+                b.send(MxCommand::LoadMembers {
+                    room_id: rid.clone(),
+                });
+            }
+        }
     }
 
     pub fn switch_room(&mut self, name: &str) {
@@ -671,6 +683,18 @@ impl App {
             }
             MxUpdate::SyncComplete => {
                 // rien à faire pour l'instant — on a déjà reçu Rooms juste avant.
+            }
+            MxUpdate::Members { room_id, members } => {
+                // On accepte la mise à jour seulement si elle correspond à la
+                // room actuellement affichée dans la vue Members.
+                if self.current_room_id.as_deref() == Some(&room_id) {
+                    self.members_state.members = members;
+                    self.members_state.set_selected(0);
+                }
+            }
+            MxUpdate::Spaces { roots } => {
+                self.space_tree_state.roots = roots;
+                self.space_tree_state.set_selected(0);
             }
         }
     }
