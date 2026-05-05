@@ -5,7 +5,7 @@ use crate::view::{login, members, room_list, settings, space_tree};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -23,6 +23,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.last_main_height = main.height;
 
     draw_status_bar(frame, chunks[0], app);
+
+    // Force-clear the main area each frame. Without this, cells that no
+    // longer carry content (e.g., a list with fewer rows than before, or a
+    // form with non-rectangular field placement) keep leftover glyphs from
+    // earlier frames in some terminals.
+    frame.render_widget(Clear, main);
 
     let mut conv_cursor: Option<(u16, u16)> = None;
     let mut other_cursor: Option<(u16, u16)> = None;
@@ -111,6 +117,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
+    // Clear the row first so a shorter flash / input does not leave behind
+    // characters from a longer previous render.
+    frame.render_widget(Clear, area);
     if app.search.active {
         let n = app.search.matches.len();
         let pos_label = if app.search.query.is_empty() {

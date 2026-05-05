@@ -294,12 +294,17 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> EventOutcome {
     let s = &mut app.settings_state;
+    let on_text = s.focus_idx == settings_view::F_EDITOR;
     match key.code {
         KeyCode::Esc => app.back_to_conversation(),
         KeyCode::Tab | KeyCode::Down => s.next(),
         KeyCode::BackTab | KeyCode::Up => s.prev(),
-        KeyCode::Char(' ') => toggle_settings_field(s),
-        KeyCode::Left | KeyCode::Right => cycle_settings_radio(s),
+        KeyCode::Char(' ') if !on_text => toggle_settings_field(s),
+        KeyCode::Left | KeyCode::Right if !on_text => cycle_settings_radio(s),
+        KeyCode::Char(c) if on_text => s.editor.push(c),
+        KeyCode::Backspace if on_text => {
+            s.editor.pop();
+        }
         KeyCode::Enter => match s.focus_idx {
             settings_view::F_DOC => {
                 app.flash = Some("ouverture documentation (mock)".into());
@@ -311,6 +316,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             settings_view::F_CANCEL => {
                 app.back_to_conversation();
             }
+            _ if on_text => s.next(),
             _ => toggle_settings_field(s),
         },
         _ => {}

@@ -179,7 +179,8 @@ impl App {
                         EventOutcome::Continue => {}
                         EventOutcome::Quit => self.should_quit = true,
                         EventOutcome::OpenEditor(content) => {
-                            if let Err(e) = suspend_for_editor(terminal, &content) {
+                            let editor = self.settings_state.editor.clone();
+                            if let Err(e) = suspend_for_editor(terminal, &content, &editor) {
                                 self.flash = Some(format!("éditeur : {e}"));
                             }
                         }
@@ -1326,9 +1327,15 @@ fn expand_by_labels(
     }
 }
 
-/// Leave raw mode + the alternate screen, run `$EDITOR` (default `vi`) on
-/// a temp file containing `content`, then re-enter the TUI.
-fn suspend_for_editor(terminal: &mut DefaultTerminal, content: &str) -> io::Result<()> {
+/// Leave raw mode + the alternate screen, run the configured editor on a
+/// temp file containing `content`, then re-enter the TUI. Resolution
+/// order for the editor command: explicit `editor` argument (settings),
+/// then the `$EDITOR` env var, then `vi` as a final fallback.
+fn suspend_for_editor(
+    terminal: &mut DefaultTerminal,
+    content: &str,
+    editor: &str,
+) -> io::Result<()> {
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     };
@@ -1339,8 +1346,12 @@ fn suspend_for_editor(terminal: &mut DefaultTerminal, content: &str) -> io::Resu
     crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
     disable_raw_mode()?;
 
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let _ = std::process::Command::new(&editor).arg(&path).status();
+    let cmd = if !editor.trim().is_empty() {
+        editor.to_string()
+    } else {
+        std::env::var("EDITOR").unwrap_or_else(|_| "vi".into())
+    };
+    let _ = std::process::Command::new(&cmd).arg(&path).status();
 
     enable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;

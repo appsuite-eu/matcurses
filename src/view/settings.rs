@@ -6,15 +6,16 @@ use ratatui::{
 };
 use widgets::{render_form, FormField};
 
-pub const FIELD_COUNT: usize = 7;
+pub const FIELD_COUNT: usize = 8;
 
 pub const F_TTS: usize = 0;
 pub const F_NATO: usize = 1;
 pub const F_SAS: usize = 2;
 pub const F_VOICE: usize = 3;
-pub const F_DOC: usize = 4;
-pub const F_SAVE: usize = 5;
-pub const F_CANCEL: usize = 6;
+pub const F_EDITOR: usize = 4;
+pub const F_DOC: usize = 5;
+pub const F_SAVE: usize = 6;
+pub const F_CANCEL: usize = 7;
 
 const SAS_OPTIONS: &[&str] = &["Décimal", "Emoji (noms)"];
 const VOICE_OPTIONS: &[&str] = &[
@@ -27,6 +28,10 @@ pub struct SettingsState {
     pub nato: bool,
     pub sas_decimal: bool,
     pub voice_toggle: bool,
+    /// Path / command of the editor used when the user presses `e` on a
+    /// long message (or `Ctrl+E` to compose). Empty falls back to
+    /// `$EDITOR` and then to `vi`.
+    pub editor: String,
     pub focus_idx: usize,
 }
 
@@ -37,6 +42,7 @@ impl SettingsState {
             nato: true,
             sas_decimal: true,
             voice_toggle: true,
+            editor: std::env::var("EDITOR").unwrap_or_default(),
             focus_idx: 0,
         }
     }
@@ -82,6 +88,12 @@ pub fn render(frame: &mut Frame, area: Rect, s: &SettingsState) -> (u16, u16) {
             label: "Mode voice notes",
             options: VOICE_OPTIONS,
             selected: if s.voice_toggle { 0 } else { 1 },
+        },
+        FormField::Spacer,
+        FormField::Text {
+            label: "Éditeur (commande)",
+            value: &s.editor,
+            masked: false,
         },
         FormField::Spacer,
         FormField::Link {
