@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/widgets"]
+
+[package]
+name = "matcurses"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+widgets = { path = "crates/widgets" }
+matrix-sdk = { version = "0.7", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+dirs = "5"
+url = "2"
+futures-util = "0.3"
