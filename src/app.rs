@@ -688,19 +688,127 @@ impl App {
         if self.input.is_empty() {
             return;
         }
-        if self.matrix_logged_in {
-            if let (Some(id), Some(b)) = (self.current_room_id.clone(), self.matrix.as_ref()) {
-                let body = self.input.clone();
-                b.send(MxCommand::SendMessage {
-                    room_id: id,
-                    body,
-                });
-                self.input.clear();
+        let raw = self.input.clone();
+        self.input.clear();
+
+        // `//foo` → escape: send literal "/foo" as a regular message.
+        // `/foo` → slash command.
+        // anything else → regular message.
+        if let Some(rest) = raw.strip_prefix("//") {
+            self.send_text(rest.to_string());
+            return;
+        }
+        if let Some(after_slash) = raw.strip_prefix('/') {
+            let trimmed = after_slash.trim_start();
+            if trimmed.is_empty() {
                 return;
             }
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let cmd = parts.next().unwrap_or("").to_string();
+            let args = parts.next().unwrap_or("").trim().to_string();
+            self.run_command(&cmd, &args);
+            return;
         }
-        // Fallback: just empty the buffer (historical mock behavior).
-        self.input.clear();
+        self.send_text(raw);
+    }
+
+    fn send_text(&mut self, body: String) {
+        if !self.matrix_logged_in {
+            return;
+        }
+        if let (Some(id), Some(b)) = (self.current_room_id.clone(), self.matrix.as_ref()) {
+            b.send(MxCommand::SendMessage { room_id: id, body });
+        }
+    }
+
+    /// Dispatch a slash-command. The full set is documented by `/help`.
+    pub fn run_command(&mut self, cmd: &str, args: &str) {
+        match cmd {
+            "quit" | "q" => self.open_quit_confirm(),
+            "help" | "h" | "?" => self.open_help(),
+            "version" => {
+                self.flash = Some(format!(
+                    "matcurses {}",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
+            "me" => {
+                if args.is_empty() {
+                    self.flash = Some("/me <texte>".into());
+                    return;
+                }
+                if let (true, Some(id), Some(b)) = (
+                    self.matrix_logged_in,
+                    self.current_room_id.clone(),
+                    self.matrix.as_ref(),
+                ) {
+                    b.send(MxCommand::SendEmote {
+                        room_id: id,
+                        body: args.to_string(),
+                    });
+                } else {
+                    self.flash = Some("/me indisponible (hors session)".into());
+                }
+            }
+            "join" | "j" => {
+                if args.is_empty() {
+                    self.flash = Some("/join <#room:server>".into());
+                    return;
+                }
+                if let (true, Some(b)) = (self.matrix_logged_in, self.matrix.as_ref()) {
+                    b.send(MxCommand::JoinRoom {
+                        alias_or_id: args.to_string(),
+                    });
+                } else {
+                    self.flash = Some("/join indisponible (hors session)".into());
+                }
+            }
+            "leave" | "part" => {
+                if let (true, Some(id), Some(b)) = (
+                    self.matrix_logged_in,
+                    self.current_room_id.clone(),
+                    self.matrix.as_ref(),
+                ) {
+                    b.send(MxCommand::LeaveRoom { room_id: id });
+                } else {
+                    self.flash = Some("/leave indisponible (hors session)".into());
+                }
+            }
+            "redact" | "del" => self.open_redact_confirm(),
+            "react" => {
+                if args.is_empty() {
+                    self.open_reaction_picker();
+                } else {
+                    self.flash =
+                        Some("/react sans argument ; ouvre le picker".into());
+                }
+            }
+            other => {
+                self.flash = Some(format!("commande inconnue : /{other}"));
+            }
+        }
+    }
+
+    fn open_help(&mut self) {
+        let lines: Vec<String> = vec![
+            "Slash-commands :".into(),
+            String::new(),
+            "/quit, /q              quitter (confirmation)".into(),
+            "/help, /h, /?          cette aide".into(),
+            "/version               version de matcurses".into(),
+            "/me <texte>            action / emote (m.emote)".into(),
+            "/join <#room:server>   rejoindre une room".into(),
+            "/leave, /part          quitter la room courante".into(),
+            "/redact, /del          supprimer le message courant".into(),
+            "/react                 ouvrir le picker de réactions".into(),
+            String::new(),
+            "Échapper un slash : commencer le message par //".into(),
+        ];
+        self.modal = Some(Modal::Details(DetailsModal {
+            title: "Aide".into(),
+            lines,
+            scroll: 0,
+        }));
     }
 
     /// Fetches and applies pending Matrix updates. Called on each

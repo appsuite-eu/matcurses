@@ -67,6 +67,12 @@ pub enum Command {
     /// Redact (delete) an event we own — typically used to toggle off a
     /// reaction we previously sent.
     RedactEvent { room_id: String, event_id: String },
+    /// Send an `m.emote` (the IRC `/me` action).
+    SendEmote { room_id: String, body: String },
+    /// Join a room by alias (`#name:server`) or id.
+    JoinRoom { alias_or_id: String },
+    /// Leave the given room.
+    LeaveRoom { room_id: String },
 }
 
 /// Updates pushed from the Matrix task to the UI.
@@ -469,6 +475,66 @@ async fn matrix_main(
                                     })
                                     .await;
                             }
+                        }
+                    });
+                }
+            }
+            Command::SendEmote { room_id, body } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = send_emote(&c, &room_id, &body).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("envoi /me : {e}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::JoinRoom { alias_or_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match join_room(&c, &alias_or_id).await {
+                            Ok(name) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("rejoint : {name}"),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/join : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::LeaveRoom { room_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = leave_room(&c, &room_id).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/leave : {e}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: "room quittée".into(),
+                                })
+                                .await;
                         }
                     });
                 }
@@ -1191,6 +1257,43 @@ async fn redact_event(
     let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
     let parsed_event: OwnedEventId = event_id.parse()?;
     room.redact(&parsed_event, None, None).await?;
+    Ok(())
+}
+
+async fn send_emote(
+    client: &Client,
+    room_id: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("room introuvable")?;
+    let content = RoomMessageEventContent::emote_plain(body);
+    room.send(content).await?;
+    Ok(())
+}
+
+async fn join_room(
+    client: &Client,
+    alias_or_id: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::OwnedRoomOrAliasId;
+    let parsed: OwnedRoomOrAliasId = alias_or_id.parse()?;
+    let room = client.join_room_by_id_or_alias(&parsed, &[]).await?;
+    let name = room
+        .display_name()
+        .await
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| room.room_id().to_string());
+    Ok(name)
+}
+
+async fn leave_room(
+    client: &Client,
+    room_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("room introuvable")?;
+    room.leave().await?;
     Ok(())
 }
 
