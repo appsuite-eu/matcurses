@@ -147,11 +147,12 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
     let prefix = app.input_mode.prefix();
     let prefix_cells = prefix.chars().count() + 1; // prefix + separator space
-    let avail = (area.width as usize).saturating_sub(prefix_cells);
+    // Reserve one cell at the end for the cursor itself, so the cursor
+    // sits AFTER the last typed character instead of overlapping it.
+    let avail = (area.width as usize)
+        .saturating_sub(prefix_cells)
+        .saturating_sub(1);
     let total = app.input.chars().count();
-    // Horizontal scroll: when the typed input is longer than the visible
-    // area, show its tail so the cursor stays on the last character. Skip
-    // is in chars (not bytes) to handle UTF-8 cleanly.
     let skip = total.saturating_sub(avail);
     let visible: String = app.input.chars().skip(skip).collect();
     let line = format!("{} {}", prefix, visible);
@@ -165,7 +166,8 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn place_input_cursor(frame: &mut Frame, area: Rect, app: &App) {
     let prefix_cells = app.input_mode.prefix().chars().count() as u16 + 1;
-    let avail = area.width.saturating_sub(prefix_cells);
+    // Mirror the reserved trailing cell from draw_input_bar.
+    let avail = area.width.saturating_sub(prefix_cells).saturating_sub(1);
     let total = app.input.chars().count() as u16;
     let visible_len = total.min(avail);
     let x = area.x + prefix_cells + visible_len;
