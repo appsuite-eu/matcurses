@@ -130,6 +130,10 @@ pub struct App {
     pub current_room_id: Option<String>,
     /// True once the Matrix login is confirmed.
     pub matrix_logged_in: bool,
+    /// Recovery key that we just sent to `Command::RecoverFromKey` and
+    /// are waiting to confirm worked. On `Update::RecoverySuccess`, if
+    /// the keychain flag is on and no entry exists yet, we persist it.
+    pub pending_recovery_key: Option<String>,
 }
 
 impl App {
@@ -160,6 +164,7 @@ impl App {
             room_ids: Vec::new(),
             current_room_id: None,
             matrix_logged_in: false,
+            pending_recovery_key: None,
         };
         // Try to restore a previously-persisted session on startup, so the
         // user doesn't have to log in again every time.
@@ -684,6 +689,29 @@ impl App {
         self.flash = Some("connexion en cours…".into());
     }
 
+    /// Trigger an SSO login: opens the homeserver SSO redirect URL in the
+    /// system browser. Only `server` from the login form is consulted —
+    /// the MXID and password fields are ignored.
+    pub fn submit_sso_login(&mut self) {
+        let server = self.login_state.server.clone();
+        if server.trim().is_empty() {
+            self.flash = Some("SSO : renseigne le serveur (ex. matrix.org)".into());
+            return;
+        }
+        let bridge = match self.matrix.as_ref() {
+            Some(b) => b,
+            None => {
+                self.flash = Some("runtime Matrix indisponible".into());
+                return;
+            }
+        };
+        bridge.send(MxCommand::LoginSso {
+            server,
+            idp_id: None,
+        });
+        self.flash = Some("SSO : ouverture du navigateur…".into());
+    }
+
     /// Sends the input buffer contents to the current room (if Matrix is active).
     pub fn submit_input(&mut self) {
         if self.input.is_empty() {
@@ -858,16 +886,86 @@ impl App {
             _ => return,
         };
         self.modal = None;
-        let trimmed = key.trim().to_string();
-        if trimmed.is_empty() {
-            self.flash = Some("clé de récupération vide".into());
+        let mut resolved = key.trim().to_string();
+
+        // Resolution chain when input is empty:
+        //   1. OS keychain entry for this MXID
+        //   2. user-configured PM command
+        if resolved.is_empty() && self.settings_state.keychain_recovery && !self.me.is_empty() {
+            match crate::secrets::load_recovery_key(&self.me) {
+                Ok(Some(k)) => {
+                    resolved = k;
+                    self.flash = Some("clé chargée depuis le keychain".into());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.flash = Some(format!("keychain : {e}"));
+                }
+            }
+        }
+        if resolved.is_empty() && !self.settings_state.pm_cmd.trim().is_empty() {
+            match crate::secrets::run_pm_command(&self.settings_state.pm_cmd) {
+                Ok(k) => {
+                    resolved = k;
+                    self.flash = Some("clé chargée depuis le password manager".into());
+                }
+                Err(e) => {
+                    self.flash = Some(format!("PM : {e}"));
+                }
+            }
+        }
+        if resolved.is_empty() {
+            self.flash = Some("clé vide (saisie + keychain + PM tous KO)".into());
             return;
         }
+
         if let Some(b) = self.matrix.as_ref() {
-            b.send(MxCommand::RecoverFromKey { key: trimmed });
+            // Stash the key so we can persist it to the keychain only after
+            // RecoverySuccess confirms it actually worked.
+            self.pending_recovery_key = Some(resolved.clone());
+            b.send(MxCommand::RecoverFromKey { key: resolved });
             self.flash = Some("restauration en cours…".into());
         } else {
             self.flash = Some("Matrix indisponible".into());
+        }
+    }
+
+    /// Copy the recovery key currently shown in the display modal to the
+    /// system clipboard.
+    pub fn copy_recovery_to_clipboard(&mut self) {
+        let key = match &self.modal {
+            Some(Modal::RecoveryDisplay(m)) => m.key.clone(),
+            _ => return,
+        };
+        match crate::secrets::copy_to_clipboard(&key) {
+            Ok(()) => {
+                self.flash = Some("clé copiée dans le presse-papier".into());
+            }
+            Err(e) => {
+                self.flash = Some(format!("copie KO : {e}"));
+            }
+        }
+    }
+
+    /// Called when the user confirms they have saved the recovery key.
+    /// Optionally persists it to the OS keychain for later auto-restore.
+    pub fn confirm_recovery_displayed(&mut self) {
+        let key = match &self.modal {
+            Some(Modal::RecoveryDisplay(m)) => m.key.clone(),
+            _ => return,
+        };
+        self.modal = None;
+        if self.settings_state.keychain_recovery && !self.me.is_empty() {
+            match crate::secrets::store_recovery_key(&self.me, &key) {
+                Ok(()) => {
+                    self.flash = Some("clé E2EE prête · sauvée dans le keychain".into());
+                }
+                Err(e) => {
+                    self.flash = Some(format!("clé prête, keychain KO : {e}"));
+                }
+            }
+        } else {
+            self.flash = Some("clé E2EE prête · note-la bien".into());
         }
     }
 
@@ -1040,6 +1138,24 @@ impl App {
                 }));
             }
             MxUpdate::RecoverySuccess => {
+                // The recovery worked: if the user wants their key cached
+                // in the OS keychain and we don't have an entry yet for
+                // this MXID, persist it now.
+                if let Some(key) = self.pending_recovery_key.take() {
+                    if self.settings_state.keychain_recovery && !self.me.is_empty() {
+                        let already = matches!(
+                            crate::secrets::load_recovery_key(&self.me),
+                            Ok(Some(_))
+                        );
+                        if !already {
+                            if let Err(e) =
+                                crate::secrets::store_recovery_key(&self.me, &key)
+                            {
+                                self.flash = Some(format!("keychain : {e}"));
+                            }
+                        }
+                    }
+                }
                 self.flash = Some("clés restaurées · refetch en cours".into());
                 if let (Some(b), Some(id)) = (self.matrix.as_ref(), self.current_room_id.clone())
                 {

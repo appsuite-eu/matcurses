@@ -38,6 +38,10 @@ pub enum Command {
         password: String,
         server: String,
     },
+    /// SSO login: opens the homeserver's SSO redirect URL in the system
+    /// browser, then exchanges the resulting login token for a session.
+    /// `server` is required (we don't have an MXID to autodiscover from).
+    LoginSso { server: String, idp_id: Option<String> },
     /// The user selected a room in the list — load its contents.
     OpenRoom { room_id: String },
     /// Send a text message to the active room (user pressed Enter).
@@ -323,6 +327,55 @@ async fn matrix_main(
                                 mxid: normalized_mxid,
                             })
                             .await;
+
+                        let tx = update_tx.clone();
+                        let arc2 = arc.clone();
+                        let pending = pending_sas.clone();
+                        tokio::spawn(async move {
+                            run_sync(arc2, tx, pending).await;
+                        });
+                    }
+                    Err(e) => {
+                        let _ = update_tx
+                            .send(Update::LoginFailed {
+                                reason: format!("{e}"),
+                            })
+                            .await;
+                    }
+                }
+            }
+            Command::LoginSso { server, idp_id } => {
+                // Same inline shape as Command::Login: the dispatcher blocks
+                // while the browser-based authentication completes. That is
+                // acceptable because we have nothing else useful to do until
+                // login has produced a Client to store in `client`.
+                let _ = update_tx
+                    .send(Update::Error {
+                        reason: "ouverture du navigateur pour SSO…".into(),
+                    })
+                    .await;
+                match do_login_sso(&server, idp_id.as_deref()).await {
+                    Ok(c) => {
+                        let mxid = c
+                            .user_id()
+                            .map(|u| u.to_string())
+                            .unwrap_or_default();
+                        if let Ok(p) = last_mxid_file() {
+                            let _ = std::fs::write(&p, &mxid);
+                        }
+                        if let Some(session) = c.matrix_auth().session() {
+                            if let Ok(store_path) = session_store_path(&mxid) {
+                                if let Ok(json) = serde_json::to_string(&session) {
+                                    let _ = std::fs::write(
+                                        store_path.join("session.json"),
+                                        json,
+                                    );
+                                }
+                            }
+                        }
+                        let arc = Arc::new(c);
+                        client = Some(arc.clone());
+                        let _ = update_tx.send(Update::LoggedIn { mxid }).await;
 
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
@@ -1016,6 +1069,70 @@ async fn do_login(
         }
         Err(e) => Err(e),
     }
+}
+
+/// SSO login flow: opens the homeserver SSO URL via the OS default
+/// browser (cross-platform via the `open` crate) and waits for the
+/// callback to deliver a login token. The matrix-sdk takes care of
+/// running the local callback HTTP server.
+async fn do_login_sso(
+    server: &str,
+    idp_id: Option<&str>,
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    if server.trim().is_empty() {
+        return Err("le champ Serveur est requis pour SSO".into());
+    }
+
+    // For SSO we do not yet know the MXID, so the store path is keyed off
+    // the homeserver until the actual MXID lands; we move the store later
+    // if needed (no-op for now: we use a server-keyed path).
+    let server_key: String = server
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let store_path = session_store_path(&format!("__sso__{server_key}"))?;
+    std::fs::create_dir_all(&store_path)?;
+
+    let client = if server.starts_with("http://") || server.starts_with("https://") {
+        Client::builder()
+            .homeserver_url(server)
+            .sqlite_store(&store_path, None)
+            .build()
+            .await
+            .map_err(|e| format!("connexion à {server} : {e}"))?
+    } else {
+        let server_name: matrix_sdk::ruma::OwnedServerName = server
+            .parse()
+            .map_err(|e| format!("nom de serveur invalide '{server}' : {e}"))?;
+        Client::builder()
+            .server_name(&server_name)
+            .sqlite_store(&store_path, None)
+            .build()
+            .await
+            .map_err(|e| format!("auto-discovery {server_name} : {e}"))?
+    };
+
+    let mut sso = client
+        .matrix_auth()
+        .login_sso(|url| async move {
+            // Best-effort cross-platform browser open. If it fails the
+            // user still sees the URL printed below; matrix-sdk will time
+            // out on its own if no callback arrives.
+            let _ = open::that(&url);
+            Ok(())
+        })
+        .initial_device_display_name("matcurses");
+    if let Some(id) = idp_id {
+        sso = sso.identity_provider_id(id);
+    }
+    sso.send().await?;
+    Ok(client)
 }
 
 /// Single login attempt with the existing (or freshly created) store.

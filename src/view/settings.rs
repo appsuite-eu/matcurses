@@ -6,16 +6,18 @@ use ratatui::{
 };
 use widgets::{render_form, FormField};
 
-pub const FIELD_COUNT: usize = 8;
+pub const FIELD_COUNT: usize = 10;
 
 pub const F_TTS: usize = 0;
 pub const F_NATO: usize = 1;
 pub const F_SAS: usize = 2;
 pub const F_VOICE: usize = 3;
 pub const F_EDITOR: usize = 4;
-pub const F_DOC: usize = 5;
-pub const F_SAVE: usize = 6;
-pub const F_CANCEL: usize = 7;
+pub const F_KEYCHAIN: usize = 5;
+pub const F_PM_CMD: usize = 6;
+pub const F_DOC: usize = 7;
+pub const F_SAVE: usize = 8;
+pub const F_CANCEL: usize = 9;
 
 const SAS_OPTIONS: &[&str] = &["Décimal", "Emoji (noms)"];
 const VOICE_OPTIONS: &[&str] = &[
@@ -32,6 +34,13 @@ pub struct SettingsState {
     /// long message (or `Ctrl+E` to compose). Empty falls back to
     /// `$EDITOR` and then to `vi`.
     pub editor: String,
+    /// Persist the E2EE recovery key into the OS keychain after `/setup`
+    /// or `/restore` so subsequent restores happen without manual input.
+    pub keychain_recovery: bool,
+    /// Optional shell command used to fetch the recovery key from a
+    /// password manager (e.g. `bw get password matcurses-recovery`,
+    /// `pass show matrix/recovery`, `op item get matrix --field password`).
+    pub pm_cmd: String,
     pub focus_idx: usize,
 }
 
@@ -43,6 +52,8 @@ impl SettingsState {
             sas_decimal: true,
             voice_toggle: true,
             editor: std::env::var("EDITOR").unwrap_or_default(),
+            keychain_recovery: true,
+            pm_cmd: String::new(),
             focus_idx: 0,
         }
     }
@@ -93,6 +104,16 @@ pub fn render(frame: &mut Frame, area: Rect, s: &SettingsState) -> (u16, u16) {
         FormField::Text {
             label: "Éditeur (commande)",
             value: &s.editor,
+            masked: false,
+        },
+        FormField::Spacer,
+        FormField::Checkbox {
+            label: "Sauver la clé E2EE dans le keychain OS",
+            checked: s.keychain_recovery,
+        },
+        FormField::Text {
+            label: "Cmd password manager (optionnelle)",
+            value: &s.pm_cmd,
             masked: false,
         },
         FormField::Spacer,

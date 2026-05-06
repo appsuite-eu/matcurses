@@ -151,11 +151,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
                 };
             }
             KeyCode::Char('n') => d.show_nato = !d.show_nato,
+            KeyCode::Char('c') => app.copy_recovery_to_clipboard(),
             KeyCode::Enter => match d.focused {
-                RecoveryDisplayFocus::Confirm => {
-                    app.close_modal();
-                    app.flash = Some("clé E2EE prête · note-la bien".into());
-                }
+                RecoveryDisplayFocus::Confirm => app.confirm_recovery_displayed(),
                 RecoveryDisplayFocus::Cancel => {
                     app.close_modal();
                     app.flash =
@@ -354,17 +352,28 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> EventOutcome {
     let s = &mut app.settings_state;
-    let on_text = s.focus_idx == settings_view::F_EDITOR;
+    let on_text =
+        s.focus_idx == settings_view::F_EDITOR || s.focus_idx == settings_view::F_PM_CMD;
     match key.code {
         KeyCode::Esc => app.back_to_conversation(),
         KeyCode::Tab | KeyCode::Down => s.next(),
         KeyCode::BackTab | KeyCode::Up => s.prev(),
         KeyCode::Char(' ') if !on_text => toggle_settings_field(s),
         KeyCode::Left | KeyCode::Right if !on_text => cycle_settings_radio(s),
-        KeyCode::Char(c) if on_text => s.editor.push(c),
-        KeyCode::Backspace if on_text => {
-            s.editor.pop();
-        }
+        KeyCode::Char(c) if on_text => match s.focus_idx {
+            settings_view::F_EDITOR => s.editor.push(c),
+            settings_view::F_PM_CMD => s.pm_cmd.push(c),
+            _ => {}
+        },
+        KeyCode::Backspace if on_text => match s.focus_idx {
+            settings_view::F_EDITOR => {
+                s.editor.pop();
+            }
+            settings_view::F_PM_CMD => {
+                s.pm_cmd.pop();
+            }
+            _ => {}
+        },
         KeyCode::Enter => match s.focus_idx {
             settings_view::F_DOC => {
                 app.flash = Some("ouverture documentation (mock)".into());
@@ -390,6 +399,7 @@ fn toggle_settings_field(s: &mut SettingsState) {
         settings_view::F_NATO => s.nato = !s.nato,
         settings_view::F_SAS => s.sas_decimal = !s.sas_decimal,
         settings_view::F_VOICE => s.voice_toggle = !s.voice_toggle,
+        settings_view::F_KEYCHAIN => s.keychain_recovery = !s.keychain_recovery,
         _ => {}
     }
 }
@@ -423,6 +433,9 @@ fn handle_login_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Enter => match s.focus_idx {
             login_view::F_CONNECT => {
                 app.submit_login();
+            }
+            login_view::F_SSO => {
+                app.submit_sso_login();
             }
             login_view::F_CANCEL => {
                 app.back_to_conversation();

@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod event;
 mod matrix;
+mod secrets;
 mod message;
 mod modal;
 mod ui;

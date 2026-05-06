@@ -6,13 +6,14 @@ use ratatui::{
 };
 use widgets::{render_form, FormField};
 
-pub const FIELD_COUNT: usize = 5;
+pub const FIELD_COUNT: usize = 6;
 
 pub const F_MXID: usize = 0;
 pub const F_PASSWORD: usize = 1;
 pub const F_SERVER: usize = 2;
 pub const F_CONNECT: usize = 3;
-pub const F_CANCEL: usize = 4;
+pub const F_SSO: usize = 4;
+pub const F_CANCEL: usize = 5;
 
 pub struct LoginState {
     pub mxid: String,
@@ -82,8 +83,9 @@ pub fn render(frame: &mut Frame, area: Rect, s: &LoginState) -> (u16, u16) {
         FormField::Spacer,
         FormField::Buttons2 {
             first: "Connexion",
-            second: "Annuler",
+            second: "SSO (navigateur)",
         },
+        FormField::Button { label: "Annuler" },
     ];
 
     let body = Rect {
