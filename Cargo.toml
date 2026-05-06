@@ -22,6 +22,9 @@ toml = "0.8"
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all", "vorbis", "mp3", "wav", "flac"] }
 opus = "0.3"
 ogg = "0.9"
+# Pitch-preserving time-stretching for voice-note speed control. Wraps the
+# vendored SoundTouch C++ library; "bundled" builds it from source via cc.
+soundtouch = { version = "0.5", features = ["bundled"] }
 open = "5"
 arboard = "3"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }

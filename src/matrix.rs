@@ -185,7 +185,6 @@ enum AudioCommand {
     Stop,
     Pause,
     Resume,
-    SetSpeed(f32),
     /// Play a short event notification sound on a detached sink. Multiple
     /// concurrent event sounds may stack; voice-note playback is unaffected.
     PlaySound {
@@ -195,12 +194,27 @@ enum AudioCommand {
 
 /// Shared handle on the currently-playing voice-note sink. The audio thread
 /// owns the rodio `OutputStream` (which is `!Send`) but the `Sink` itself is
-/// `Send + Sync` and exposes `pause()`, `play()`, `set_speed()`,
-/// `get_pos()`, etc., so the UI thread can both control playback and read
-/// its position through this mutex.
-#[derive(Default)]
+/// `Send + Sync` and exposes `pause()`, `play()`, `get_pos()`, etc., so the
+/// UI thread can both control playback and read its position through this
+/// mutex. The `tempo` atomic is read each refill by `StretchSource` so the
+/// UI thread can change pitch-preserving playback speed mid-playback.
 pub struct AudioControl {
     current: std::sync::Mutex<Option<rodio::Sink>>,
+    tempo: crate::audio::SharedTempo,
+    /// Source-time playback position in seconds, updated by `StretchSource`
+    /// as it pulls frames from the decoder. Independent of tempo, so
+    /// changing playback speed does not skew the displayed position.
+    position: crate::audio::SharedPosition,
+}
+
+impl Default for AudioControl {
+    fn default() -> Self {
+        Self {
+            current: std::sync::Mutex::new(None),
+            tempo: crate::audio::make_shared_tempo(),
+            position: crate::audio::make_shared_position(),
+        }
+    }
 }
 
 /// Snapshot of the active voice-note playback, sampled by the UI each frame.
@@ -259,8 +273,10 @@ impl MatrixBridge {
     }
 
     /// Adjust the playback speed of the active voice (typically 0.5..=2.0).
+    /// Pitch-preserving: the change is applied through SoundTouch inside
+    /// `StretchSource`, not through `Sink::set_speed` which only resamples.
     pub fn voice_set_speed(&self, speed: f32) {
-        let _ = self.audio_tx.send(AudioCommand::SetSpeed(speed));
+        crate::audio::store_tempo(&self.audio_control.tempo, speed);
     }
 
     /// Snapshot the current voice playback state, or `None` if no voice
@@ -269,8 +285,11 @@ impl MatrixBridge {
         let guard = self.audio_control.current.lock().ok()?;
         let sink = guard.as_ref()?;
         Some(VoiceStatus {
-            pos_secs: sink.get_pos().as_secs_f32(),
-            speed: sink.speed(),
+            // Source-time position published by `StretchSource`, not the
+            // sink's wall-clock counter — wall-clock would diverge from
+            // the displayed source duration as soon as tempo ≠ 1.0.
+            pos_secs: crate::audio::load_position(&self.audio_control.position),
+            speed: crate::audio::load_tempo(&self.audio_control.tempo),
             paused: sink.is_paused(),
             finished: sink.empty(),
         })
@@ -315,7 +334,16 @@ fn audio_thread(
                         s.stop();
                     }
                 }
-                match try_play(&handle, bytes) {
+                // Reset tempo so a new voice starts at 1.0× regardless of
+                // what the previous playback was set to.
+                crate::audio::store_tempo(&control.tempo, 1.0);
+                crate::audio::store_position(&control.position, 0.0);
+                match try_play(
+                    &handle,
+                    bytes,
+                    control.tempo.clone(),
+                    control.position.clone(),
+                ) {
                     Ok(sink) => {
                         if let Ok(mut g) = control.current.lock() {
                             *g = Some(sink);
@@ -348,13 +376,6 @@ fn audio_thread(
                     }
                 }
             }
-            AudioCommand::SetSpeed(v) => {
-                if let Ok(g) = control.current.lock() {
-                    if let Some(s) = g.as_ref() {
-                        s.set_speed(v.clamp(0.25, 4.0));
-                    }
-                }
-            }
             AudioCommand::PlaySound { bytes } => {
                 let cursor = std::io::Cursor::new(bytes);
                 if let Ok(source) = rodio::Decoder::new(cursor) {
@@ -373,23 +394,27 @@ fn audio_thread(
 
 /// Try to decode `bytes` and produce a playing `Sink`. Tries rodio's built-in
 /// decoders first (MP3/M4A/FLAC/WAV/Vorbis via Symphonia), then falls back
-/// to our custom OGG/Opus path.
+/// to our custom OGG/Opus path. The decoded source is wrapped in a
+/// `StretchSource` so the UI thread can adjust tempo (pitch-preserving)
+/// through the shared atomic.
 fn try_play(
     handle: &rodio::OutputStreamHandle,
     bytes: Vec<u8>,
+    tempo: crate::audio::SharedTempo,
+    position: crate::audio::SharedPosition,
 ) -> Result<rodio::Sink, String> {
     // First attempt: rodio + Symphonia.
     let bytes_for_rodio = bytes.clone();
     if let Ok(source) = rodio::Decoder::new(std::io::Cursor::new(bytes_for_rodio)) {
         let sink = rodio::Sink::try_new(handle).map_err(|e| format!("sink : {e}"))?;
-        sink.append(source);
+        sink.append(crate::audio::StretchSource::new(source, tempo, position));
         return Ok(sink);
     }
     // Second attempt: OGG/Opus (covers the common voice-note case).
     match crate::audio::OpusSource::try_from_bytes(bytes) {
         Ok(source) => {
             let sink = rodio::Sink::try_new(handle).map_err(|e| format!("sink : {e}"))?;
-            sink.append(source);
+            sink.append(crate::audio::StretchSource::new(source, tempo, position));
             Ok(sink)
         }
         Err(opus_err) => Err(format!("aucun décodeur supporté ({opus_err})")),
@@ -1496,6 +1521,12 @@ async fn run_sync(
             }
         },
     );
+
+    // Surface the cached rooms (restored from the SQLite store by
+    // `restore_session`) immediately. Otherwise the UI sees zero rooms
+    // until the initial network sync returns — which on a delta sync with
+    // an outdated next_batch token can take the full 30 s timeout.
+    let _ = tx.send(snapshot_rooms(&client).await).await;
 
     // Premier sync pour peupler.
     let settings = SyncSettings::new().timeout(Duration::from_secs(30));

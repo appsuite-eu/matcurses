@@ -920,10 +920,14 @@ impl App {
         };
         let status = match b.voice_status() {
             Some(s) => s,
-            None => {
-                self.voice_playing = None;
-                return;
-            }
+            // The sink may not be loaded yet (download + decode is still in
+            // flight) or it has just been stopped from elsewhere. Either
+            // way, do not wipe `voice_playing` here — clearing it would
+            // race the audio thread between `play_current_voice` and the
+            // sink actually appearing in the shared mutex, leaving the
+            // user with no transport keys (space/esc/(/)) for the live
+            // playback. Explicit stops set `voice_playing = None` themselves.
+            None => return,
         };
         if status.finished {
             self.voice_playing = None;
