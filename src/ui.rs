@@ -18,8 +18,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Length(1), // top status: room title + flash
+            Constraint::Min(1),    // main view
+            Constraint::Length(1), // window status (irssi-style)
             Constraint::Length(input_height),
         ])
         .split(frame.area());
@@ -84,7 +85,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    draw_input_bar(frame, chunks[2], app);
+    draw_window_status(frame, chunks[2], app);
+    draw_input_bar(frame, chunks[3], app);
 
     if let Some(modal) = &app.modal {
         let cursor = draw_modal(frame, frame.area(), modal);
@@ -92,7 +94,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         match app.view {
             View::Conversation => match app.focus {
-                Focus::Input => place_input_cursor(frame, chunks[2], app),
+                Focus::Input => place_input_cursor(frame, chunks[3], app),
                 Focus::Conversation => {
                     if let Some((x, y)) = conv_cursor {
                         frame.set_cursor_position((x, y));
@@ -108,6 +110,51 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
     }
+}
+
+/// Irssi-style status line between the conversation area and the input
+/// bar. Shows the active window number, any non-active windows that
+/// gained activity since the user last looked at them (with a `*`
+/// prefix on the ones that mention the user), the local time, and a
+/// connection state glyph.
+fn draw_window_status(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::app::ActivityLevel;
+    let active = format!("[{}]", app.active_window + 1);
+
+    let mut act: Vec<String> = Vec::new();
+    let mut mention: Vec<String> = Vec::new();
+    for (i, w) in app.windows.iter().enumerate() {
+        if i == app.active_window {
+            continue;
+        }
+        match w.activity {
+            ActivityLevel::None => {}
+            ActivityLevel::Active => act.push(format!("{}", i + 1)),
+            ActivityLevel::Mention => mention.push(format!("{}", i + 1)),
+        }
+    }
+
+    let mut left_parts = vec![active];
+    if !act.is_empty() {
+        left_parts.push(format!("[Act: {}]", act.join(",")));
+    }
+    if !mention.is_empty() {
+        left_parts.push(format!("[Mention: {}]", mention.join(",")));
+    }
+    let left = left_parts.join(" ");
+
+    let now = chrono::Local::now().format("%H:%M").to_string();
+    let conn = if app.matrix_logged_in { "●" } else { "○" };
+    let right = format!("{} {}", now, conn);
+
+    widgets::render_status_bar(
+        frame,
+        area,
+        &widgets::StatusBar {
+            left: &left,
+            right: &right,
+        },
+    );
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {

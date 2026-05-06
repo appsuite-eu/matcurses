@@ -140,6 +140,45 @@ pub struct CompletionState {
     pub current: usize,
 }
 
+/// Activity flag for a non-focused window, irssi-style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityLevel {
+    None,
+    /// Plain new message in the room.
+    Active,
+    /// New message that mentions the local user.
+    Mention,
+}
+
+/// Per-room scrollback / cursor / thread state. The app keeps one of
+/// these for each open window (irssi-style); the active window's data
+/// is mirrored into `App.messages` / `expanded_threads` / `selected` /
+/// `scroll_top` / `current_room` / `current_room_id` while focused, and
+/// saved back on window switch.
+pub struct ChatWindow {
+    pub room_id: Option<String>,
+    pub room_name: String,
+    pub messages: Vec<Message>,
+    pub expanded_threads: HashSet<usize>,
+    pub selected: usize,
+    pub scroll_top: usize,
+    pub activity: ActivityLevel,
+}
+
+impl ChatWindow {
+    pub fn empty() -> Self {
+        Self {
+            room_id: None,
+            room_name: String::new(),
+            messages: Vec::new(),
+            expanded_threads: HashSet::new(),
+            selected: 0,
+            scroll_top: 0,
+            activity: ActivityLevel::None,
+        }
+    }
+}
+
 pub struct App {
     pub view: View,
     pub focus: Focus,
@@ -180,6 +219,11 @@ pub struct App {
     /// In-flight Tab completion (slash command or `@user` mention).
     /// Reset to None on any key event other than Tab/BackTab.
     pub pending_completion: Option<CompletionState>,
+    /// All open chat windows (irssi-style). The active one's state is
+    /// mirrored into the top-level `messages` / `current_room*` fields
+    /// while focused.
+    pub windows: Vec<ChatWindow>,
+    pub active_window: usize,
 }
 
 impl App {
@@ -213,6 +257,8 @@ impl App {
             matrix_logged_in: false,
             pending_recovery_key: None,
             pending_completion: None,
+            windows: vec![ChatWindow::empty()],
+            active_window: 0,
         };
         // Try to restore a previously-persisted session on startup, so the
         // user doesn't have to log in again every time.
@@ -688,6 +734,71 @@ impl App {
         }
     }
 
+    /// Snapshot the focused window's per-room state from the top-level
+    /// `App` fields. Called before activating a different window.
+    fn save_active_window(&mut self) {
+        if let Some(w) = self.windows.get_mut(self.active_window) {
+            w.room_id = self.current_room_id.clone();
+            w.room_name = self.current_room.clone();
+            w.messages = std::mem::take(&mut self.messages);
+            w.expanded_threads = std::mem::take(&mut self.expanded_threads);
+            w.selected = self.selected;
+            w.scroll_top = self.scroll_top;
+        }
+    }
+
+    /// Restore the given window's state into the top-level `App` fields
+    /// and mark it as active. Triggers a Matrix refetch when the window
+    /// has a matrix room id.
+    fn load_window(&mut self, idx: usize) {
+        if idx >= self.windows.len() {
+            return;
+        }
+        self.active_window = idx;
+        let w = &mut self.windows[idx];
+        self.current_room = w.room_name.clone();
+        self.current_room_id = w.room_id.clone();
+        self.messages = std::mem::take(&mut w.messages);
+        self.expanded_threads = std::mem::take(&mut w.expanded_threads);
+        self.selected = w.selected;
+        self.scroll_top = w.scroll_top;
+        // Entering the window dismisses any pending activity for it.
+        w.activity = ActivityLevel::None;
+        self.update_status();
+    }
+
+    /// Switch to window `idx` (0-based). No-op if out of range or already
+    /// active. Refetches the room timeline so it stays current.
+    pub fn switch_window(&mut self, idx: usize) {
+        if idx == self.active_window || idx >= self.windows.len() {
+            return;
+        }
+        self.save_active_window();
+        self.load_window(idx);
+        if let (Some(b), Some(rid)) =
+            (self.matrix.as_ref(), self.current_room_id.clone())
+        {
+            b.send(MxCommand::OpenRoom { room_id: rid });
+        }
+    }
+
+    pub fn next_window(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let next = (self.active_window + 1) % self.windows.len();
+        self.switch_window(next);
+    }
+
+    pub fn prev_window(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let n = self.windows.len();
+        let prev = (self.active_window + n - 1) % n;
+        self.switch_window(prev);
+    }
+
     /// Switch to a room. The argument may be either a display name (from F4)
     /// or a Matrix room_id (from F3, where the tree stores ids).
     pub fn switch_room(&mut self, name_or_id: &str) {
@@ -728,10 +839,48 @@ impl App {
             }
         };
 
+        // If a window already shows this room, just focus it.
+        if let Some(existing) = self
+            .windows
+            .iter()
+            .position(|w| w.room_id.as_deref() == Some(&id))
+        {
+            // Active window already on this room: just refetch.
+            if existing == self.active_window {
+                if let Some(b) = self.matrix.as_ref() {
+                    b.send(MxCommand::OpenRoom { room_id: id });
+                }
+            } else {
+                self.switch_window(existing);
+            }
+            self.flash = Some(format!("focus {}", display));
+            self.view = View::Conversation;
+            return;
+        }
+
+        // Open the room in the current window if it is empty (no room yet),
+        // otherwise create a new window.
+        let target = if self.windows.is_empty() {
+            self.windows.push(ChatWindow::empty());
+            0
+        } else if self.windows[self.active_window].room_id.is_none() {
+            self.active_window
+        } else {
+            self.save_active_window();
+            self.windows.push(ChatWindow {
+                room_id: Some(id.clone()),
+                room_name: display.clone(),
+                ..ChatWindow::empty()
+            });
+            self.windows.len() - 1
+        };
+
+        // Reset top-level state for the new (or repurposed) active window.
+        if target != self.active_window {
+            self.active_window = target;
+        }
         self.current_room = display.clone();
         self.current_room_id = Some(id.clone());
-        // Clear any previous messages (mock or previous room) so the user
-        // doesn't see stale data while real messages load.
         self.messages.clear();
         self.expanded_threads.clear();
         self.selected = 0;
@@ -1121,6 +1270,42 @@ impl App {
             "restore" | "recovery" => self.open_recovery_input(),
             "setup" | "enable-recovery" => self.enable_recovery(),
             "logout" => self.open_logout_confirm(),
+            "window" | "win" | "w" => {
+                let arg = args.trim();
+                match arg {
+                    "" | "list" => {
+                        let mut lines = vec![format!(
+                            "Fenêtres ouvertes : {}",
+                            self.windows.len()
+                        )];
+                        for (i, w) in self.windows.iter().enumerate() {
+                            let mark = if i == self.active_window {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            let label = if w.room_name.is_empty() {
+                                "(vide)".to_string()
+                            } else {
+                                w.room_name.clone()
+                            };
+                            lines.push(format!("{}{}: {}", mark, i + 1, label));
+                        }
+                        self.flash = Some(lines.join(" · "));
+                    }
+                    "next" | "n" => self.next_window(),
+                    "prev" | "p" | "previous" => self.prev_window(),
+                    other => match other.parse::<usize>() {
+                        Ok(n) if n >= 1 && n <= self.windows.len() => {
+                            self.switch_window(n - 1);
+                        }
+                        _ => {
+                            self.flash =
+                                Some(format!("/window : '{}' n'est pas un numéro valide", other));
+                        }
+                    },
+                }
+            }
             "verify" => {
                 let target = if args.is_empty() { None } else { Some(args) };
                 self.verify_user(target);
@@ -1300,6 +1485,7 @@ impl App {
             "/restore, /recovery    importer une clé de récupération E2EE".into(),
             "/verify [@user:srv]    vérification SAS (défaut : soi-même)".into(),
             "/logout                déconnexion + wipe local".into(),
+            "/window N | n | p     basculer de fenêtre · Alt+1..9 / Alt+n / Alt+p".into(),
             String::new(),
             "Échapper un slash : commencer le message par //".into(),
         ];
@@ -1423,6 +1609,29 @@ impl App {
                         crate::sounds::SoundKind::Message
                     });
                     self.update_status();
+                } else if let Some(idx) = self
+                    .windows
+                    .iter()
+                    .position(|w| w.room_id.as_deref() == Some(&room_id))
+                {
+                    let mentioned = is_mention(&message, &self.me);
+                    if let Some(w) = self.windows.get_mut(idx) {
+                        let was_at_bottom = w.selected + 1 >= w.messages.len();
+                        w.messages.push(message);
+                        if was_at_bottom {
+                            w.selected = w.messages.len().saturating_sub(1);
+                        }
+                        // Bump activity, escalate to Mention but never
+                        // downgrade an existing Mention.
+                        w.activity = match (w.activity, mentioned) {
+                            (_, true) => ActivityLevel::Mention,
+                            (ActivityLevel::Mention, _) => ActivityLevel::Mention,
+                            _ => ActivityLevel::Active,
+                        };
+                    }
+                    if mentioned {
+                        self.play_event_sound(crate::sounds::SoundKind::Mention);
+                    }
                 }
             }
             MxUpdate::Error { reason } => {
@@ -1919,8 +2128,13 @@ impl App {
                 Focus::Conversation => "Conv",
                 Focus::Input => "Saisie",
             };
+            let win = if self.windows.len() > 1 {
+                format!("[w{}/{}] ", self.active_window + 1, self.windows.len())
+            } else {
+                String::new()
+            };
             self.status_text =
-                format!("{} · {}{}{}", focus, pos, suffix, reactions_marker);
+                format!("{}{} · {}{}{}", win, focus, pos, suffix, reactions_marker);
         } else {
             self.status_text = view_label.to_string();
         }

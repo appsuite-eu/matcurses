@@ -46,6 +46,31 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             _ => {}
         }
     }
+    // Alt + digit / Alt+n / Alt+p: window navigation. Works in any view
+    // since a window switch always lands in the conversation view.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as u8 - b'1') as usize;
+                if idx < app.windows.len() {
+                    app.switch_window(idx);
+                    app.view = crate::app::View::Conversation;
+                }
+                return EventOutcome::Continue;
+            }
+            KeyCode::Char('n') => {
+                app.next_window();
+                app.view = crate::app::View::Conversation;
+                return EventOutcome::Continue;
+            }
+            KeyCode::Char('p') => {
+                app.prev_window();
+                app.view = crate::app::View::Conversation;
+                return EventOutcome::Continue;
+            }
+            _ => {}
+        }
+    }
     match app.view {
         View::Conversation => match app.focus {
             Focus::Conversation => handle_conversation_key(app, key),
