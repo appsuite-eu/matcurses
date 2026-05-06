@@ -126,6 +126,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             }
             _ => {}
         },
+        Modal::SasVerification(s) => match key.code {
+            KeyCode::Esc => app.sas_cancel(),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                s.focused = match s.focused {
+                    ConfirmButton::Yes => ConfirmButton::No,
+                    ConfirmButton::No => ConfirmButton::Yes,
+                };
+            }
+            KeyCode::Char('y') | KeyCode::Char('o') => app.sas_confirm(),
+            KeyCode::Char('n') => app.sas_mismatch(),
+            KeyCode::Enter => match s.focused {
+                ConfirmButton::Yes => app.sas_confirm(),
+                ConfirmButton::No => app.sas_mismatch(),
+            },
+            _ => {}
+        },
         Modal::RecoveryDisplay(d) => match key.code {
             KeyCode::Esc => app.close_modal(),
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {

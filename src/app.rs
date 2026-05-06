@@ -46,7 +46,7 @@ impl SearchState {
 use crate::modal::{
     ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal, ReactedByModal,
     ReactionPickerModal, RecoveryDisplayFocus, RecoveryDisplayModal, RecoveryFocus,
-    RecoveryInputModal,
+    RecoveryInputModal, SasVerificationModal,
 };
 use crate::ui::draw;
 use crate::view::login::LoginState;
@@ -778,6 +778,10 @@ impl App {
             "redact" | "del" => self.open_redact_confirm(),
             "restore" | "recovery" => self.open_recovery_input(),
             "setup" | "enable-recovery" => self.enable_recovery(),
+            "verify" => {
+                let target = if args.is_empty() { None } else { Some(args) };
+                self.verify_user(target);
+            }
             "react" => {
                 if args.is_empty() {
                     self.open_reaction_picker();
@@ -790,6 +794,44 @@ impl App {
                 self.flash = Some(format!("commande inconnue : /{other}"));
             }
         }
+    }
+
+    pub fn verify_user(&mut self, target: Option<&str>) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/verify indisponible (hors session)".into());
+            return;
+        }
+        let user_id = match target {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => self.me.clone(),
+        };
+        if user_id.is_empty() {
+            self.flash = Some("MXID inconnu — précise /verify @user:server".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::VerifyUser { user_id });
+            self.flash = Some("vérification : en attente d'acceptation côté pair…".into());
+        }
+    }
+
+    pub fn sas_confirm(&mut self) {
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SasConfirm);
+        }
+    }
+
+    pub fn sas_mismatch(&mut self) {
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SasMismatch);
+        }
+    }
+
+    pub fn sas_cancel(&mut self) {
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SasCancel);
+        }
+        self.modal = None;
     }
 
     pub fn enable_recovery(&mut self) {
@@ -843,6 +885,7 @@ impl App {
             "/react                 ouvrir le picker de réactions".into(),
             "/setup                 générer la clé E2EE (1re fois sur ce compte)".into(),
             "/restore, /recovery    importer une clé de récupération E2EE".into(),
+            "/verify [@user:srv]    vérification SAS (défaut : soi-même)".into(),
             String::new(),
             "Échapper un slash : commencer le message par //".into(),
         ];
@@ -869,6 +912,7 @@ impl App {
         match u {
             MxUpdate::LoggedIn { mxid } => {
                 self.matrix_logged_in = true;
+                self.me = mxid.clone();
                 self.flash = Some(format!("connecté · {}", mxid));
                 // Return to the conversation if we were on Login.
                 if matches!(self.view, View::Login) {
@@ -969,6 +1013,24 @@ impl App {
                         m.presence = presence;
                     }
                 }
+            }
+            MxUpdate::SasReady { decimal, emoji } => {
+                self.modal = Some(Modal::SasVerification(SasVerificationModal {
+                    decimal,
+                    emoji,
+                    focused: ConfirmButton::No,
+                }));
+                self.flash = Some(
+                    "SAS prêt — compare et valide (y/o ou n).".into(),
+                );
+            }
+            MxUpdate::SasDone { ok } => {
+                self.modal = None;
+                self.flash = Some(if ok {
+                    "vérification réussie".into()
+                } else {
+                    "vérification échouée ou annulée".into()
+                });
             }
             MxUpdate::RecoveryKeyGenerated { key } => {
                 self.modal = Some(Modal::RecoveryDisplay(RecoveryDisplayModal {

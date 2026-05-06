@@ -81,6 +81,15 @@ pub enum Command {
     /// secured by a freshly-generated recovery key. The key is returned
     /// via `Update::RecoveryKeyGenerated` for the user to save.
     EnableRecovery,
+    /// Initiate a SAS verification request against `user_id`. Typically
+    /// used to verify another device of the same user.
+    VerifyUser { user_id: String },
+    /// Acknowledge that the SAS values match (mark the device verified).
+    SasConfirm,
+    /// Acknowledge a SAS mismatch (abort the verification, alert).
+    SasMismatch,
+    /// Cancel the in-flight SAS verification.
+    SasCancel,
 }
 
 /// Updates pushed from the Matrix task to the UI.
@@ -123,6 +132,16 @@ pub enum Update {
     /// generated. The UI must show this to the user — they will not
     /// be able to retrieve it again later.
     RecoveryKeyGenerated { key: String },
+    /// SAS verification has reached the comparison phase: show the
+    /// decimal triple and emoji words to the user, who confirms match
+    /// or mismatch.
+    SasReady {
+        decimal: (u16, u16, u16),
+        emoji: Vec<(String, String)>,
+    },
+    /// SAS verification finished. `ok = true` means it was confirmed
+    /// matching on both sides; `false` means mismatch / cancel / error.
+    SasDone { ok: bool },
     /// Presence update for a single member, scoped to the room it was
     /// requested from. Fired after `LoadMembers` once each per-user
     /// `GET /presence/{user}/status` response comes back.
@@ -252,12 +271,23 @@ fn try_play(
     }
 }
 
+#[derive(Debug)]
+enum SasUserDecision {
+    Confirm,
+    Mismatch,
+    Cancel,
+}
+
 /// Main loop of the Matrix task: receives commands, drives the client.
 async fn matrix_main(
     mut cmd_rx: Receiver<Command>,
     update_tx: Sender<Update>,
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
 ) {
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+    let pending_sas: Arc<AsyncMutex<Option<tokio::sync::oneshot::Sender<SasUserDecision>>>> =
+        Arc::new(AsyncMutex::new(None));
     let mut client: Option<Arc<Client>> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
@@ -532,6 +562,48 @@ async fn matrix_main(
                             }
                         }
                     });
+                }
+            }
+            Command::VerifyUser { user_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    let pending = pending_sas.clone();
+                    tokio::spawn(async move {
+                        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+                        *pending.lock().await = Some(decision_tx);
+                        let result = run_sas_verification(&c, &user_id, &tx, decision_rx).await;
+                        // Drop any pending decision sender that wasn't claimed.
+                        let _ = pending.lock().await.take();
+                        match result {
+                            Ok(ok) => {
+                                let _ = tx.send(Update::SasDone { ok }).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("verify : {e}"),
+                                    })
+                                    .await;
+                                let _ = tx.send(Update::SasDone { ok: false }).await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::SasConfirm => {
+                if let Some(s) = pending_sas.lock().await.take() {
+                    let _ = s.send(SasUserDecision::Confirm);
+                }
+            }
+            Command::SasMismatch => {
+                if let Some(s) = pending_sas.lock().await.take() {
+                    let _ = s.send(SasUserDecision::Mismatch);
+                }
+            }
+            Command::SasCancel => {
+                if let Some(s) = pending_sas.lock().await.take() {
+                    let _ = s.send(SasUserDecision::Cancel);
                 }
             }
             Command::EnableRecovery => {
@@ -1365,6 +1437,118 @@ async fn recover_from_key(
     }
     client.encryption().recovery().recover(trimmed).await?;
     Ok(())
+}
+
+/// Drive a full SAS verification flow against `user_id`.
+///
+/// Steps:
+/// 1. Request verification on the user's identity.
+/// 2. Wait for the request to be ready (the other end accepted).
+/// 3. Start the short authentication string flow.
+/// 4. Wait for keys to be exchanged so we can present decimals + emoji.
+/// 5. Push `Update::SasReady` to the UI and await a `SasUserDecision`
+///    via the oneshot.
+/// 6. Apply the decision (`confirm`/`mismatch`/`cancel`) and wait for
+///    the verification to settle.
+///
+/// Returns `Ok(true)` if the verification finished as confirmed on
+/// both sides, `Ok(false)` for mismatch / cancellation.
+async fn run_sas_verification(
+    client: &Client,
+    user_id: &str,
+    tx: &Sender<Update>,
+    decision_rx: tokio::sync::oneshot::Receiver<SasUserDecision>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    use futures_util::StreamExt;
+    use matrix_sdk::encryption::verification::SasState;
+    use matrix_sdk::ruma::OwnedUserId;
+
+    let parsed: OwnedUserId = user_id.parse()?;
+    let identity = client
+        .encryption()
+        .get_user_identity(&parsed)
+        .await?
+        .ok_or("user identity not found (re-sync may help)")?;
+
+    let request = identity.request_verification().await?;
+
+    // Wait for the request to be ready (other side accepted the request).
+    {
+        let mut changes = request.changes();
+        loop {
+            if request.is_ready() {
+                break;
+            }
+            if request.is_cancelled() || request.is_done() {
+                return Err("verification request closed".into());
+            }
+            if changes.next().await.is_none() {
+                break;
+            }
+        }
+    }
+
+    // Start the SAS sub-protocol.
+    let sas = request
+        .start_sas()
+        .await?
+        .ok_or("SAS not negotiable for this peer")?;
+
+    // Wait for the SAS to be presentable (keys exchanged).
+    {
+        let mut changes = sas.changes();
+        loop {
+            if sas.can_be_presented() {
+                break;
+            }
+            if sas.is_cancelled() || sas.is_done() {
+                return Err("SAS closed before presentation".into());
+            }
+            if changes.next().await.is_none() {
+                break;
+            }
+        }
+    }
+
+    let decimal = sas
+        .decimals()
+        .ok_or("SAS produced no decimals")?;
+    let emoji_strings: Vec<(String, String)> = sas
+        .emoji()
+        .map(|emoji| {
+            emoji
+                .iter()
+                .map(|e| (e.symbol.to_string(), e.description.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let _ = tx
+        .send(Update::SasReady {
+            decimal,
+            emoji: emoji_strings,
+        })
+        .await;
+
+    let decision = decision_rx
+        .await
+        .map_err(|_| "no SAS decision delivered")?;
+
+    match decision {
+        SasUserDecision::Confirm => sas.confirm().await?,
+        SasUserDecision::Mismatch => sas.mismatch().await?,
+        SasUserDecision::Cancel => sas.cancel().await?,
+    }
+
+    // Wait for the SAS to settle.
+    let mut changes = sas.changes();
+    while !sas.is_done() && !sas.is_cancelled() {
+        if changes.next().await.is_none() {
+            break;
+        }
+    }
+
+    Ok(matches!(sas.state(), SasState::Done { .. }))
 }
 
 async fn enable_recovery(

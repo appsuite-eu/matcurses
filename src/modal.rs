@@ -58,6 +58,13 @@ pub enum Modal {
     ReactedBy(ReactedByModal),
     RecoveryInput(RecoveryInputModal),
     RecoveryDisplay(RecoveryDisplayModal),
+    SasVerification(SasVerificationModal),
+}
+
+pub struct SasVerificationModal {
+    pub decimal: (u16, u16, u16),
+    pub emoji: Vec<(String, String)>,
+    pub focused: ConfirmButton,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +104,7 @@ pub fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) -> ModalCursor {
         Modal::ReactedBy(m) => draw_reacted_by(frame, area, m),
         Modal::RecoveryInput(m) => draw_recovery_input(frame, area, m),
         Modal::RecoveryDisplay(m) => draw_recovery_display(frame, area, m),
+        Modal::SasVerification(m) => draw_sas_verification(frame, area, m),
     }
 }
 
@@ -231,6 +239,93 @@ fn draw_reaction_picker(frame: &mut Frame, area: Rect, m: &ReactionPickerModal) 
     };
     let (cx, cy) = render_list(frame, inner, &rows, &mut state, None);
     ModalCursor { x: cx, y: cy }
+}
+
+fn draw_sas_verification(
+    frame: &mut Frame,
+    area: Rect,
+    m: &SasVerificationModal,
+) -> ModalCursor {
+    let (a, b, c) = m.decimal;
+    let mut content_lines: Vec<Line> = Vec::new();
+    content_lines.push(Line::raw(
+        "Compare ces 3 nombres avec l'autre device :",
+    ));
+    content_lines.push(Line::raw(""));
+    content_lines.push(Line::raw(format!("    {}    {}    {}", a, b, c)));
+    if !m.emoji.is_empty() {
+        content_lines.push(Line::raw(""));
+        content_lines.push(Line::raw("Ou via les 7 mots emoji :"));
+        let words: Vec<String> = m
+            .emoji
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect();
+        content_lines.push(Line::raw(format!("    {}", words.join(" · "))));
+    }
+    content_lines.push(Line::raw(""));
+    content_lines.push(Line::raw(
+        "y / o : ça correspond  ·  n : ça ne correspond pas (alerte)",
+    ));
+
+    let body_w = 70.min(area.width.saturating_sub(2));
+    let popup_h = (content_lines.len() as u16 + 4).min(area.height);
+    let popup = centered_rect(area, body_w.max(40), popup_h.max(10));
+    let inner = render_modal_frame(
+        frame,
+        popup,
+        &ModalFrame {
+            title: "Vérification SAS",
+            footer: Some("Tab: alterner · Entrée: valider · Esc: annuler"),
+        },
+    );
+
+    let content_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
+    };
+    frame.render_widget(Paragraph::new(content_lines), content_area);
+
+    let yes = "Correspond";
+    let no = "Ne correspond pas";
+    let yw = (yes.chars().count() + 4) as u16;
+    let nw = (no.chars().count() + 4) as u16;
+    let row_y = inner.y + inner.height.saturating_sub(1);
+    let yes_area = Rect {
+        x: inner.x,
+        y: row_y,
+        width: yw,
+        height: 1,
+    };
+    let no_area = Rect {
+        x: inner.x + yw + 2,
+        y: row_y,
+        width: nw,
+        height: 1,
+    };
+    let (cx_y, cy_y) = render_button(
+        frame,
+        yes_area,
+        &Button {
+            label: yes,
+            focused: m.focused == ConfirmButton::Yes,
+        },
+    );
+    let (cx_n, cy_n) = render_button(
+        frame,
+        no_area,
+        &Button {
+            label: no,
+            focused: m.focused == ConfirmButton::No,
+        },
+    );
+    let (x, y) = match m.focused {
+        ConfirmButton::Yes => (cx_y, cy_y),
+        ConfirmButton::No => (cx_n, cy_n),
+    };
+    ModalCursor { x, y }
 }
 
 fn draw_recovery_display(
