@@ -103,6 +103,8 @@ pub struct App {
     pub view: View,
     pub focus: Focus,
     pub input: String,
+    /// Char-position of the editing cursor inside `input` (0..=chars().count()).
+    pub input_cursor: usize,
     pub input_mode: InputMode,
     pub current_room: String,
     pub status_text: String,
@@ -142,6 +144,7 @@ impl App {
             view: View::Conversation,
             focus: Focus::Conversation,
             input: String::new(),
+            input_cursor: 0,
             input_mode: InputMode::Normal,
             current_room: String::new(),
             status_text: String::new(),
@@ -194,7 +197,7 @@ impl App {
                             let editor = self.settings_state.editor.clone();
                             match suspend_for_input_editor(terminal, &content, &editor) {
                                 Ok(Some(new_content)) => {
-                                    self.input = new_content;
+                                    self.input_set(new_content);
                                     self.flash = Some(
                                         "saisie chargée · Entrée envoie".into(),
                                     );
@@ -752,12 +755,81 @@ impl App {
     }
 
     /// Sends the input buffer contents to the current room (if Matrix is active).
+    fn byte_index_for_char(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    pub fn input_insert_char(&mut self, c: char) {
+        let pos = self.byte_index_for_char(self.input_cursor);
+        self.input.insert(pos, c);
+        self.input_cursor += 1;
+    }
+
+    pub fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        self.input_cursor -= 1;
+        let pos = self.byte_index_for_char(self.input_cursor);
+        self.input.remove(pos);
+    }
+
+    pub fn input_delete_forward(&mut self) {
+        let total = self.input.chars().count();
+        if self.input_cursor >= total {
+            return;
+        }
+        let pos = self.byte_index_for_char(self.input_cursor);
+        self.input.remove(pos);
+    }
+
+    pub fn input_left(&mut self) {
+        if self.input_cursor > 0 {
+            self.input_cursor -= 1;
+        }
+    }
+
+    pub fn input_right(&mut self) {
+        let total = self.input.chars().count();
+        if self.input_cursor < total {
+            self.input_cursor += 1;
+        }
+    }
+
+    pub fn input_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    pub fn input_end(&mut self) {
+        self.input_cursor = self.input.chars().count();
+    }
+
+    /// Readline-style Ctrl+K: drop everything from the cursor to end of line.
+    pub fn input_kill_to_end(&mut self) {
+        let pos = self.byte_index_for_char(self.input_cursor);
+        self.input.truncate(pos);
+    }
+
+    pub fn input_clear(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    pub fn input_set(&mut self, content: String) {
+        self.input_cursor = content.chars().count();
+        self.input = content;
+    }
+
     pub fn submit_input(&mut self) {
         if self.input.is_empty() {
             return;
         }
         let raw = self.input.clone();
-        self.input.clear();
+        self.input_clear();
 
         // `//foo` → escape: send literal "/foo" as a regular message.
         // `/foo` → slash command.

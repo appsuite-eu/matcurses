@@ -351,10 +351,17 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('g') if ctrl => {
             return EventOutcome::EditInput(app.input.clone());
         }
-        KeyCode::Char(c) if !ctrl => app.input.push(c),
-        KeyCode::Backspace => {
-            app.input.pop();
-        }
+        // Readline-style cursor movement and editing.
+        KeyCode::Left => app.input_left(),
+        KeyCode::Right => app.input_right(),
+        KeyCode::Home => app.input_home(),
+        KeyCode::End => app.input_end(),
+        KeyCode::Char('a') if ctrl => app.input_home(),
+        KeyCode::Char('e') if ctrl => app.input_end(),
+        KeyCode::Char('k') if ctrl => app.input_kill_to_end(),
+        KeyCode::Delete => app.input_delete_forward(),
+        KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
+        KeyCode::Backspace => app.input_backspace(),
         KeyCode::Enter => {
             app.submit_input();
         }

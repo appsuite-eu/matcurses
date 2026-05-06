@@ -152,9 +152,8 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
     let avail = (area.width as usize)
         .saturating_sub(prefix_cells)
         .saturating_sub(1);
-    let total = app.input.chars().count();
-    let skip = total.saturating_sub(avail);
-    let visible: String = app.input.chars().skip(skip).collect();
+    let scroll = input_scroll_chars(app, avail);
+    let visible: String = app.input.chars().skip(scroll).take(avail).collect();
     let line = format!("{} {}", prefix, visible);
     let style = if app.focus == Focus::Input {
         Style::default()
@@ -166,13 +165,28 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn place_input_cursor(frame: &mut Frame, area: Rect, app: &App) {
     let prefix_cells = app.input_mode.prefix().chars().count() as u16 + 1;
-    // Mirror the reserved trailing cell from draw_input_bar.
-    let avail = area.width.saturating_sub(prefix_cells).saturating_sub(1);
-    let total = app.input.chars().count() as u16;
-    let visible_len = total.min(avail);
-    let x = area.x + prefix_cells + visible_len;
+    let avail = (area.width as usize)
+        .saturating_sub(prefix_cells as usize)
+        .saturating_sub(1);
+    let scroll = input_scroll_chars(app, avail);
+    let cursor_offset = app.input_cursor.saturating_sub(scroll) as u16;
+    let x = area.x + prefix_cells + cursor_offset;
     let max_x = area.right().saturating_sub(1);
     frame.set_cursor_position((x.min(max_x), area.y));
+}
+
+/// Compute how many leading characters of `app.input` should be scrolled
+/// off the visible window so that the editing cursor stays inside it.
+/// Window size is `avail` cells.
+fn input_scroll_chars(app: &App, avail: usize) -> usize {
+    if avail == 0 {
+        return app.input_cursor;
+    }
+    if app.input_cursor < avail {
+        0
+    } else {
+        app.input_cursor - avail
+    }
 }
 
 fn search_query_owned(app: &App) -> Option<String> {
