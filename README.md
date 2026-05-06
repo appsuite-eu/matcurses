@@ -118,6 +118,8 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/version` | Show version |
 | `/me <action>` | Send an emote |
 | `/join <room>`, `/j` | Join a room |
+| `/rooms [server]`, `/discover [server]` | Browse the public room directory of `server` (or local) |
+| `/spaces [server]` | Browse the public spaces directory of `server` (or local) |
 | `/leave`, `/part` | Leave the active room |
 | `/redact`, `/del` | Redact the selected message |
 | `/react <emoji>` | React to the selected message |

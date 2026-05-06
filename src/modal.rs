@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 use widgets::{
-    centered_rect, render_button, render_list, render_modal_frame, render_text_input, Button,
+    render_button, render_list, render_modal_frame, render_text_input, Button,
     ListRow, ListState, ModalFrame, TextInput,
 };
 
@@ -54,6 +54,14 @@ pub enum Modal {
     RecoveryDisplay(RecoveryDisplayModal),
     SasVerification(SasVerificationModal),
     WindowList(WindowListModal),
+    PublicRooms(PublicRoomsModal),
+}
+
+pub struct PublicRoomsModal {
+    pub server: String,
+    pub kind: crate::matrix::PublicKind,
+    pub entries: Vec<crate::matrix::PublicRoomEntry>,
+    pub selected: usize,
 }
 
 pub struct WindowListEntry {
@@ -114,19 +122,86 @@ pub fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) -> ModalCursor {
         Modal::RecoveryDisplay(m) => draw_recovery_display(frame, area, m),
         Modal::SasVerification(m) => draw_sas_verification(frame, area, m),
         Modal::WindowList(m) => draw_window_list(frame, area, m),
+        Modal::PublicRooms(m) => draw_public_rooms(frame, area, m),
+    }
+}
+
+fn draw_public_rooms(frame: &mut Frame, area: Rect, m: &PublicRoomsModal) -> ModalCursor {
+    let label = match m.kind {
+        crate::matrix::PublicKind::Rooms => "rooms",
+        crate::matrix::PublicKind::Spaces => "spaces",
+    };
+    let server_disp = if m.server.is_empty() {
+        "(serveur local)"
+    } else {
+        m.server.as_str()
+    };
+    let title = format!("/{label} {server_disp} — {} entrées", m.entries.len());
+    let popup = area;
+    let inner = render_modal_frame(
+        frame,
+        popup,
+        &ModalFrame {
+            title: &title,
+            footer: Some("↑↓ parcourir · Entrée: rejoindre · Esc fermer"),
+        },
+    );
+
+    if m.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "Aucune room publique. Le serveur n'expose peut-être pas de directory.",
+            ),
+            inner,
+        );
+        return ModalCursor { x: inner.x, y: inner.y };
+    }
+
+    let rows: Vec<ListRow> = m
+        .entries
+        .iter()
+        .map(|e| {
+            // Cursor lands on the canonical alias / id so braille users
+            // hear what they'll join, not just the cosmetic display name.
+            let topic = e.topic.as_deref().unwrap_or("").trim();
+            let topic_part = if topic.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", first_line(topic, 80))
+            };
+            let line = format!(
+                "  {} ({} membres) · {}{}",
+                e.name, e.members, e.join_target, topic_part
+            );
+            let cursor_col: u16 = ("  ".chars().count()
+                + e.name.chars().count()
+                + format!(" ({} membres) · ", e.members).chars().count())
+                .try_into()
+                .unwrap_or(0);
+            ListRow::new(line).cursor_col(cursor_col)
+        })
+        .collect();
+    let mut state = ListState {
+        selected: m.selected,
+        scroll_top: 0,
+    };
+    let (cx, cy) = render_list(frame, inner, &rows, &mut state, None);
+    ModalCursor { x: cx, y: cy }
+}
+
+fn first_line(s: &str, max_chars: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    let trimmed: String = line.chars().take(max_chars).collect();
+    if line.chars().count() > max_chars {
+        format!("{trimmed}…")
+    } else {
+        trimmed
     }
 }
 
 fn draw_window_list(frame: &mut Frame, area: Rect, m: &WindowListModal) -> ModalCursor {
-    let max_w = m
-        .entries
-        .iter()
-        .map(|e| e.label.chars().count())
-        .max()
-        .unwrap_or(20)
-        + 8;
-    let h = (m.entries.len() as u16 + 4).min(area.height);
-    let popup = centered_rect(area, (max_w as u16).max(36), h.max(6));
+    let _ = m;
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,
@@ -157,14 +232,7 @@ fn draw_window_list(frame: &mut Frame, area: Rect, m: &WindowListModal) -> Modal
 }
 
 fn draw_confirm(frame: &mut Frame, area: Rect, m: &ConfirmModal) -> ModalCursor {
-    let inner_width = m
-        .message
-        .chars()
-        .count()
-        .max(m.title.chars().count())
-        .max(20) as u16
-        + 4;
-    let popup = centered_rect(area, inner_width.min(area.width), 7);
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,
@@ -227,20 +295,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, m: &ConfirmModal) -> ModalCursor 
 }
 
 fn draw_details(frame: &mut Frame, area: Rect, m: &DetailsModal) -> ModalCursor {
-    let max_w = m
-        .lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(20)
-        .max(m.title.chars().count())
-        + 4;
-    let max_h = (m.lines.len() + 4).min(area.height as usize) as u16;
-    let popup = centered_rect(
-        area,
-        (max_w as u16).min(area.width).max(30),
-        max_h.max(7),
-    );
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,
@@ -266,7 +321,7 @@ fn draw_details(frame: &mut Frame, area: Rect, m: &DetailsModal) -> ModalCursor 
 }
 
 fn draw_reaction_picker(frame: &mut Frame, area: Rect, m: &ReactionPickerModal) -> ModalCursor {
-    let popup = centered_rect(area, 36, (m.options.len() as u16 + 4).min(area.height));
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,
@@ -316,9 +371,7 @@ fn draw_sas_verification(
         "y / o : ça correspond  ·  n : ça ne correspond pas (alerte)",
     ));
 
-    let body_w = 70.min(area.width.saturating_sub(2));
-    let popup_h = (content_lines.len() as u16 + 4).min(area.height);
-    let popup = centered_rect(area, body_w.max(40), popup_h.max(10));
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,
@@ -399,9 +452,7 @@ fn draw_recovery_display(
         }
     }
 
-    let body_w = 70.min(area.width.saturating_sub(2));
-    let popup_h = (content_lines.len() as u16 + 4).min(area.height);
-    let popup = centered_rect(area, body_w.max(40), popup_h.max(8));
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,
@@ -541,7 +592,7 @@ fn draw_recovery_input(
     area: Rect,
     m: &RecoveryInputModal,
 ) -> ModalCursor {
-    let popup = centered_rect(area, 70.min(area.width), 8);
+    let popup = area;
     let inner = render_modal_frame(
         frame,
         popup,

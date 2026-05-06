@@ -159,6 +159,23 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             KeyCode::Enter => app.pick_window_from_list(),
             _ => {}
         },
+        Modal::PublicRooms(m) => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_modal(),
+            KeyCode::Up => m.selected = m.selected.saturating_sub(1),
+            KeyCode::Down => {
+                m.selected = (m.selected + 1).min(m.entries.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => m.selected = m.selected.saturating_sub(10),
+            KeyCode::PageDown => {
+                m.selected = (m.selected + 10).min(m.entries.len().saturating_sub(1));
+            }
+            KeyCode::Home | KeyCode::Char('g') => m.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                m.selected = m.entries.len().saturating_sub(1);
+            }
+            KeyCode::Enter => app.join_selected_public_room(),
+            _ => {}
+        },
         Modal::SasVerification(s) => match key.code {
             KeyCode::Esc => app.sas_cancel(),
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
@@ -332,7 +349,7 @@ fn handle_space_tree_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Right | KeyCode::Char('+') | KeyCode::Enter
     ) {
         match app.space_tree_state.open() {
-            Action::OpenRoom(name) => app.switch_room(&name),
+            Action::OpenRoom(name) => app.open_room_or_join(&name),
             Action::None => {
                 // The user expanded a space. Trigger a LoadSpaces refresh so
                 // children populated by recent sync iterations show up.

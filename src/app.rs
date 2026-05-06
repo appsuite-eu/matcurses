@@ -1,5 +1,7 @@
 use crate::event::{handle_key, EventOutcome};
-use crate::matrix::{Command as MxCommand, MatrixBridge, Update as MxUpdate};
+use crate::matrix::{
+    Command as MxCommand, MatrixBridge, PublicKind as MxPublicKind, Update as MxUpdate,
+};
 use crate::message::{build_visible_items, Block, ItemKind, Message, ViewItem};
 use std::time::{Duration, Instant};
 
@@ -44,7 +46,7 @@ impl SearchState {
     }
 }
 use crate::modal::{
-    ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal,
+    ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal, PublicRoomsModal,
     ReactionPickerModal, RecoveryDisplayFocus, RecoveryDisplayModal, RecoveryFocus,
     RecoveryInputModal, SasVerificationModal, WindowListEntry, WindowListModal,
 };
@@ -124,6 +126,9 @@ const SLASH_COMMANDS: &[&str] = &[
     "window",
     "win",
     "w",
+    "rooms",
+    "discover",
+    "spaces",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +246,10 @@ pub struct App {
     /// Voice note that is currently being played (or paused). Refreshed
     /// each tick from the audio thread.
     pub voice_playing: Option<VoicePlayback>,
+    /// Room id that we asked the server to join and want to switch to as
+    /// soon as it shows up in the next `Update::Rooms` snapshot. Driven
+    /// by Enter on a not-yet-joined room from the spaces tree.
+    pub pending_open_after_join: Option<String>,
 }
 
 /// Tracks which message is being played, the message's full duration, and
@@ -292,6 +301,7 @@ impl App {
             reply_to: None,
             thread_root: None,
             voice_playing: None,
+            pending_open_after_join: None,
         };
         if s.settings_state.reopen_windows && !s.settings_state.last_windows.is_empty() {
             s.pending_reopen = s.settings_state.last_windows.clone();
@@ -855,6 +865,51 @@ impl App {
         }
     }
 
+    /// Trigger a `/rooms` (or `/discover`, `/spaces`) lookup. The result
+    /// arrives later as `MxUpdate::PublicRooms` and gets surfaced as a
+    /// modal list.
+    pub fn discover_public(&mut self, args: &str, kind: MxPublicKind) {
+        let server = args.trim().to_string();
+        if !self.matrix_logged_in {
+            self.flash = Some("indisponible (hors session)".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::DiscoverPublicRooms {
+                server: server.clone(),
+                kind,
+            });
+            let label = match kind {
+                MxPublicKind::Rooms => "rooms",
+                MxPublicKind::Spaces => "spaces",
+            };
+            let where_ = if server.is_empty() { "(local)" } else { server.as_str() };
+            self.flash = Some(format!("/{label} {where_} : recherche…"));
+        }
+    }
+
+    /// Join the entry under the cursor in the public-rooms modal, then
+    /// close the modal.
+    pub fn join_selected_public_room(&mut self) {
+        let target = match &self.modal {
+            Some(Modal::PublicRooms(m)) => {
+                m.entries.get(m.selected).map(|e| e.join_target.clone())
+            }
+            _ => None,
+        };
+        let target = match target {
+            Some(t) => t,
+            None => return,
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::JoinRoom {
+                alias_or_id: target.clone(),
+            });
+            self.flash = Some(format!("rejoindre {target}…"));
+        }
+        self.close_modal();
+    }
+
     pub fn stop_voice(&mut self) {
         if let Some(b) = self.matrix.as_ref() {
             b.send(MxCommand::StopVoice);
@@ -1101,6 +1156,30 @@ impl App {
 
     /// Switch to a room. The argument may be either a display name (from F4)
     /// or a Matrix room_id (from F3, where the tree stores ids).
+    /// Open a room from the spaces tree. If the target is already in the
+    /// local rooms list, switch to it immediately. Otherwise fire a
+    /// JoinRoom and remember the target so the next sync that surfaces
+    /// it can auto-focus the new room.
+    pub fn open_room_or_join(&mut self, name_or_id: &str) {
+        let known = self
+            .room_list_state
+            .rooms
+            .iter()
+            .any(|r| r.name == name_or_id)
+            || self.room_ids.iter().any(|id| id == name_or_id);
+        if known || !self.matrix_logged_in {
+            self.switch_room(name_or_id);
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::JoinRoom {
+                alias_or_id: name_or_id.to_string(),
+            });
+            self.pending_open_after_join = Some(name_or_id.to_string());
+            self.flash = Some(format!("rejoindre {name_or_id}…"));
+        }
+    }
+
     pub fn switch_room(&mut self, name_or_id: &str) {
         // Try match-by-name first, then match-by-id.
         let mut idx = self
@@ -1717,6 +1796,8 @@ impl App {
                     self.flash = Some("/me indisponible (hors session)".into());
                 }
             }
+            "rooms" | "discover" => self.discover_public(args, MxPublicKind::Rooms),
+            "spaces" => self.discover_public(args, MxPublicKind::Spaces),
             "join" | "j" => {
                 if args.is_empty() {
                     self.flash = Some("/join <#room:server>".into());
@@ -2041,6 +2122,24 @@ impl App {
                         self.room_list_state.set_selected(pos);
                     }
                 }
+                // Auto-focus the room we just joined from the spaces tree
+                // (set by `open_room_or_join`) once the homeserver
+                // surfaces it in this rooms snapshot.
+                if let Some(target) = self.pending_open_after_join.clone() {
+                    let appeared = self
+                        .room_ids
+                        .iter()
+                        .any(|id| id == &target)
+                        || self
+                            .room_list_state
+                            .rooms
+                            .iter()
+                            .any(|r| r.name == target);
+                    if appeared {
+                        self.pending_open_after_join = None;
+                        self.switch_room(&target);
+                    }
+                }
             }
             MxUpdate::RoomMessages { room_id, messages } => {
                 if self.current_room_id.as_deref() == Some(&room_id) {
@@ -2189,6 +2288,14 @@ impl App {
                 {
                     b.send(MxCommand::OpenRoom { room_id: id });
                 }
+            }
+            MxUpdate::PublicRooms { server, kind, entries } => {
+                self.modal = Some(Modal::PublicRooms(PublicRoomsModal {
+                    server,
+                    kind,
+                    entries,
+                    selected: 0,
+                }));
             }
             MxUpdate::Spaces { roots } => {
                 // Preserve user state across reloads: keep the currently

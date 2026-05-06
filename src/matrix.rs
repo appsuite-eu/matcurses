@@ -30,6 +30,27 @@ use crate::view::members::{Member as UiMember, Presence as UiPresence};
 use crate::view::room_list::Room as UiRoom;
 use crate::view::space_tree::{Node as UiNode, NodeKind as UiNodeKind};
 
+/// Which slice of a homeserver's public directory to surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicKind {
+    /// Regular rooms (`m.room` / no `room_type`); excludes spaces.
+    Rooms,
+    /// Spaces only (`room_type = "m.space"`).
+    Spaces,
+}
+
+/// One entry from a public room directory query, flattened down to what
+/// the UI list needs.
+#[derive(Debug, Clone)]
+pub struct PublicRoomEntry {
+    pub name: String,
+    pub topic: Option<String>,
+    pub members: u64,
+    /// Preferred join target: `#alias:server` if the room has a canonical
+    /// alias, otherwise the bare room id (works for federated joins too).
+    pub join_target: String,
+}
+
 /// Commands sent from the UI to the Matrix task.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -87,6 +108,9 @@ pub enum Command {
     SendEmote { room_id: String, body: String },
     /// Join a room by alias (`#name:server`) or id.
     JoinRoom { alias_or_id: String },
+    /// Fetch the public room directory of `server` (or the local server
+    /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
+    DiscoverPublicRooms { server: String, kind: PublicKind },
     /// Leave the given room.
     LeaveRoom { room_id: String },
     /// Restore E2EE keys (cross-signing + Megolm key backup) from a
@@ -148,6 +172,12 @@ pub enum Update {
     },
     /// Spaces tree (in response to LoadSpaces).
     Spaces { roots: Vec<UiNode> },
+    /// Result of a `DiscoverPublicRooms` query.
+    PublicRooms {
+        server: String,
+        kind: PublicKind,
+        entries: Vec<PublicRoomEntry>,
+    },
     /// E2EE recovery succeeded: keys imported, the UI may want to
     /// refetch the current room so previously-undecryptable messages
     /// show up in clear.
@@ -760,6 +790,28 @@ async fn matrix_main(
                     });
                 }
             }
+            Command::DiscoverPublicRooms { server, kind } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match discover_public_rooms(&c, &server, kind).await {
+                            Ok(entries) => {
+                                let _ = tx
+                                    .send(Update::PublicRooms { server, kind, entries })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/discover : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
             Command::JoinRoom { alias_or_id } => {
                 if let Some(c) = &client {
                     let tx = update_tx.clone();
@@ -1199,49 +1251,101 @@ async fn collect_space_children(
     space: &matrix_sdk::Room,
     visited: &mut std::collections::HashSet<String>,
 ) -> Vec<UiNode> {
-    use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
-    let mut out = Vec::new();
-    let raw_events = match space
-        .get_state_events_static::<SpaceChildEventContent>()
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => return out,
+    use matrix_sdk::ruma::api::client::space::get_hierarchy;
+    use matrix_sdk::ruma::room::RoomType;
+    use std::collections::HashMap;
+
+    // The space hierarchy endpoint (`GET /rooms/{id}/hierarchy`, MSC2946 /
+    // spec 1.2) returns RoomSummary chunks for the space and all
+    // descendants the homeserver knows about — even ones the user has
+    // not joined. The previous implementation walked m.space.child state
+    // events and dropped any child where `client.get_room()` returned
+    // None, which made every public space look empty.
+    let mut request = get_hierarchy::v1::Request::new(space.room_id().to_owned());
+    request.limit = Some(100u32.into());
+    request.max_depth = Some(1u32.into());
+    let response = match client.send(request).await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
     };
-    for raw in raw_events {
+
+    // First chunk is the queried space itself; subsequent chunks are its
+    // direct children at depth 1.
+    let mut iter = response.rooms.into_iter();
+    let space_chunk = match iter.next() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let summaries: HashMap<OwnedRoomId, _> =
+        iter.map(|c| (c.summary.room_id.clone(), c.summary)).collect();
+
+    let mut out = Vec::new();
+    for raw in space_chunk.children_state.iter() {
         let parsed = match raw.deserialize() {
             Ok(p) => p,
             Err(_) => continue,
         };
-        // state_key is the child room ID
-        let child_id_str = parsed.state_key().to_string();
+        let child_id = parsed.state_key.clone();
+        let child_id_str = child_id.to_string();
         if visited.contains(&child_id_str) {
             continue;
         }
-        let child_id: OwnedRoomId = match child_id_str.parse() {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let child_room = match client.get_room(&child_id) {
-            Some(r) => r,
-            None => continue,
-        };
-        if child_room.is_space() {
-            let node = Box::pin(build_space_node(client, &child_room, visited)).await;
-            out.push(node);
+        let summary = summaries.get(&child_id);
+
+        // Type (space vs room) and label come from local SDK state if we
+        // already know about the child, otherwise from the hierarchy
+        // summary, otherwise we fall back to the room id.
+        let local = client.get_room(&child_id);
+        let is_space = if let Some(r) = &local {
+            r.is_space()
+        } else if let Some(s) = summary {
+            matches!(s.room_type, Some(RoomType::Space))
         } else {
-            visited.insert(child_id_str.clone());
-            let label = child_room
-                .display_name()
+            false
+        };
+        let label = if let Some(r) = &local {
+            r.display_name()
                 .await
                 .map(|n| n.to_string())
-                .unwrap_or_else(|_| child_id_str.clone());
-            let counts = child_room.unread_notification_counts();
+                .unwrap_or_else(|_| {
+                    summary
+                        .and_then(|s| s.name.clone())
+                        .unwrap_or_else(|| child_id_str.clone())
+                })
+        } else if let Some(s) = summary {
+            s.name.clone().unwrap_or_else(|| child_id_str.clone())
+        } else {
+            child_id_str.clone()
+        };
+
+        if is_space {
+            if let Some(r) = local {
+                // Joined sub-space: recurse to get its own children.
+                let node = Box::pin(build_space_node(client, &r, visited)).await;
+                out.push(node);
+            } else {
+                // Not joined yet: surface the sub-space as a leaf so the
+                // user can see it and join via /rooms or /join.
+                visited.insert(child_id_str.clone());
+                out.push(UiNode {
+                    label,
+                    kind: UiNodeKind::Space {
+                        expanded: false,
+                        children: Vec::new(),
+                    },
+                });
+            }
+        } else {
+            visited.insert(child_id_str.clone());
+            let unread = local
+                .as_ref()
+                .map(|r| r.unread_notification_counts().notification_count as usize)
+                .unwrap_or(0);
             out.push(UiNode {
                 label,
                 kind: UiNodeKind::Room {
                     name: child_id_str,
-                    unread: counts.notification_count as usize,
+                    unread,
                 },
             });
         }
@@ -1819,6 +1923,53 @@ async fn send_emote(
     Ok(())
 }
 
+async fn discover_public_rooms(
+    client: &Client,
+    server: &str,
+    kind: PublicKind,
+) -> Result<Vec<PublicRoomEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::api::client::directory::get_public_rooms_filtered::v3 as f;
+    use matrix_sdk::ruma::directory::{Filter, RoomTypeFilter};
+    use matrix_sdk::ruma::OwnedServerName;
+
+    let mut request = f::Request::new();
+    if !server.trim().is_empty() {
+        let parsed: OwnedServerName = server.trim().parse()?;
+        request.server = Some(parsed);
+    }
+    request.limit = Some(100u32.into());
+    let mut filter = Filter::new();
+    filter.room_types = vec![match kind {
+        PublicKind::Rooms => RoomTypeFilter::Default,
+        PublicKind::Spaces => RoomTypeFilter::Space,
+    }];
+    request.filter = filter;
+
+    let response = client.public_rooms_filtered(request).await?;
+    let entries = response
+        .chunk
+        .into_iter()
+        .map(|c| {
+            let join_target = c
+                .canonical_alias
+                .as_ref()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| c.room_id.to_string());
+            let name = c
+                .name
+                .clone()
+                .unwrap_or_else(|| join_target.clone());
+            PublicRoomEntry {
+                name,
+                topic: c.topic.clone(),
+                members: u64::from(c.num_joined_members),
+                join_target,
+            }
+        })
+        .collect();
+    Ok(entries)
+}
+
 async fn join_room(
     client: &Client,
     alias_or_id: &str,
@@ -1826,11 +1977,17 @@ async fn join_room(
     use matrix_sdk::ruma::OwnedRoomOrAliasId;
     let parsed: OwnedRoomOrAliasId = alias_or_id.parse()?;
     let room = client.join_room_by_id_or_alias(&parsed, &[]).await?;
-    let name = room
-        .display_name()
-        .await
-        .map(|n| n.to_string())
-        .unwrap_or_else(|_| room.room_id().to_string());
+    // Right after a remote join, the room's state has not been synced yet,
+    // so `display_name()` returns `RoomDisplayName::Empty` ("Empty Room").
+    // Fall back to whatever the user typed so the flash is meaningful;
+    // the rooms list will pick up the proper name on the next sync.
+    use matrix_sdk::RoomDisplayName;
+    let name = match room.display_name().await {
+        Ok(RoomDisplayName::Empty) | Ok(RoomDisplayName::EmptyWas(_)) | Err(_) => {
+            alias_or_id.to_string()
+        }
+        Ok(n) => n.to_string(),
+    };
     Ok(name)
 }
 
