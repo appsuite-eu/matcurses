@@ -1436,11 +1436,64 @@ impl App {
             b.send(MxCommand::SendMessage {
                 room_id: id,
                 body,
-                reply_to,
-                thread_root,
+                reply_to: reply_to.clone(),
+                thread_root: thread_root.clone(),
             });
+            // Replying to a message (rich-reply or thread) should leave
+            // the cursor on the original target, with the thread expanded
+            // so the user can keep reading the conversation. Without this,
+            // a thread reply sent from the input bar visually "closes"
+            // the thread for the user.
+            let target = reply_to.or_else(|| thread_root.clone());
+            if let Some(eid) = target {
+                self.focus_event_id(&eid, thread_root.is_some());
+                self.set_focus(Focus::Conversation);
+            }
         }
         self.clear_compose_target();
+    }
+
+    /// Move the conversation cursor onto the message with the given event
+    /// id. If `expand_thread` is true (or the target is itself a thread
+    /// reply), the parent's thread is expanded so the message is visible.
+    fn focus_event_id(&mut self, event_id: &str, expand_thread: bool) {
+        let mut found: Option<(usize, Option<usize>)> = None;
+        for (i, m) in self.messages.iter().enumerate() {
+            if m.event_id == event_id {
+                found = Some((i, None));
+                break;
+            }
+            for (j, r) in m.replies.iter().enumerate() {
+                if r.event_id == event_id {
+                    found = Some((i, Some(j)));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (msg_idx, reply_idx) = match found {
+            Some(p) => p,
+            None => return,
+        };
+        if expand_thread || reply_idx.is_some() {
+            self.expanded_threads.insert(msg_idx);
+        }
+        let visible = self.visible_items();
+        for (k, it) in visible.iter().enumerate() {
+            let matches = match it.kind {
+                ItemKind::Top => it.msg_idx == msg_idx && reply_idx.is_none(),
+                ItemKind::Reply => {
+                    it.msg_idx == msg_idx && Some(it.reply_idx) == reply_idx
+                }
+            };
+            if matches {
+                self.selected = k;
+                self.update_status();
+                return;
+            }
+        }
     }
 
     /// Drop any pending reply / thread target. Called on send and on Esc
