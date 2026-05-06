@@ -346,7 +346,18 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::F(3) => app.open_spaces(),
         KeyCode::F(4) => app.open_rooms(),
         KeyCode::F(5) => app.open_members(),
-        KeyCode::Up => app.set_focus(Focus::Conversation),
+        // ↑ : move cursor to previous line; if already on the first line
+        // of the input, leave input focus to browse the conversation.
+        KeyCode::Up => {
+            if !app.input_up() {
+                app.set_focus(Focus::Conversation);
+            }
+        }
+        // ↓ : move cursor to next line of the input. No-op when already on
+        // the last line (we don't have a "field below" yet).
+        KeyCode::Down => {
+            app.input_down();
+        }
         // Ctrl+G — pop $EDITOR with the current input as initial content.
         KeyCode::Char('g') if ctrl => {
             return EventOutcome::EditInput(app.input.clone());
@@ -354,10 +365,14 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         // Readline-style cursor movement and editing.
         KeyCode::Left => app.input_left(),
         KeyCode::Right => app.input_right(),
-        KeyCode::Home => app.input_home(),
-        KeyCode::End => app.input_end(),
-        KeyCode::Char('a') if ctrl => app.input_home(),
-        KeyCode::Char('e') if ctrl => app.input_end(),
+        // Home / End / Ctrl+A / Ctrl+E act on the current line.
+        KeyCode::Home if !ctrl => app.input_line_home(),
+        KeyCode::End if !ctrl => app.input_line_end(),
+        KeyCode::Char('a') if ctrl => app.input_line_home(),
+        KeyCode::Char('e') if ctrl => app.input_line_end(),
+        // Ctrl+Home / Ctrl+End reach the start / end of the whole buffer.
+        KeyCode::Home if ctrl => app.input_home(),
+        KeyCode::End if ctrl => app.input_end(),
         KeyCode::Char('k') if ctrl => app.input_kill_to_end(),
         KeyCode::Char('s') if ctrl => app.submit_input(),
         KeyCode::Delete => app.input_delete_forward(),

@@ -808,10 +808,59 @@ impl App {
         self.input_cursor = self.input.chars().count();
     }
 
-    /// Readline-style Ctrl+K: drop everything from the cursor to end of line.
+    /// Move the cursor to column 0 of the current line.
+    pub fn input_line_home(&mut self) {
+        let (line, _) = cursor_line_col(&self.input, self.input_cursor);
+        self.input_cursor = char_pos_for_line_col(&self.input, line, 0);
+    }
+
+    /// Move the cursor to the end of the current line.
+    pub fn input_line_end(&mut self) {
+        let (line, _) = cursor_line_col(&self.input, self.input_cursor);
+        let lines: Vec<&str> = self.input.split('\n').collect();
+        let line_len = lines.get(line).map(|l| l.chars().count()).unwrap_or(0);
+        self.input_cursor = char_pos_for_line_col(&self.input, line, line_len);
+    }
+
+    /// Move the input cursor up one line, preserving column when possible.
+    /// Returns false when the cursor is already on the first line so the
+    /// caller can decide what to do (e.g. exit input focus).
+    pub fn input_up(&mut self) -> bool {
+        let (line, col) = cursor_line_col(&self.input, self.input_cursor);
+        if line == 0 {
+            return false;
+        }
+        self.input_cursor = char_pos_for_line_col(&self.input, line - 1, col);
+        true
+    }
+
+    /// Move the input cursor down one line, preserving column when possible.
+    /// Returns false when the cursor is already on the last line.
+    pub fn input_down(&mut self) -> bool {
+        let (line, col) = cursor_line_col(&self.input, self.input_cursor);
+        let total = self.input.split('\n').count();
+        if line + 1 >= total {
+            return false;
+        }
+        self.input_cursor = char_pos_for_line_col(&self.input, line + 1, col);
+        true
+    }
+
+    /// Readline-style Ctrl+K: drop everything from the cursor up to (but
+    /// not including) the next newline. At the end of a non-final line
+    /// this is a no-op rather than swallowing the newline — matches what
+    /// most readline-flavored editors do for blind-friendly predictability.
     pub fn input_kill_to_end(&mut self) {
-        let pos = self.byte_index_for_char(self.input_cursor);
-        self.input.truncate(pos);
+        let (line, col) = cursor_line_col(&self.input, self.input_cursor);
+        let lines: Vec<&str> = self.input.split('\n').collect();
+        let line_len = lines.get(line).map(|l| l.chars().count()).unwrap_or(0);
+        if col >= line_len {
+            return;
+        }
+        let end_char = char_pos_for_line_col(&self.input, line, line_len);
+        let start = self.byte_index_for_char(self.input_cursor);
+        let end = self.byte_index_for_char(end_char);
+        self.input.replace_range(start..end, "");
     }
 
     pub fn input_clear(&mut self) {
@@ -1893,6 +1942,54 @@ fn suspend_for_editor(
 
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// Walk `s` and return the (line, column) char-coordinates of the
+/// `cursor` index (in chars).
+fn cursor_line_col(s: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, c) in s.chars().enumerate() {
+        if i == cursor {
+            return (line, col);
+        }
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Convert a (line, column) target back to a flat char index in `s`,
+/// clamping the column to the chosen line's length.
+fn char_pos_for_line_col(s: &str, target_line: usize, target_col: usize) -> usize {
+    let mut idx = 0usize;
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, c) in s.chars().enumerate() {
+        if line == target_line && col == target_col {
+            return i;
+        }
+        if c == '\n' {
+            if line == target_line {
+                // Reached end of the target line: clamp here.
+                return i;
+            }
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        idx = i + 1;
+    }
+    if line == target_line && col >= target_col {
+        let _ = idx;
+        return s.chars().count();
+    }
+    s.chars().count()
 }
 
 /// Heuristic detection of a mention of `me` in `message`. Matches the full
