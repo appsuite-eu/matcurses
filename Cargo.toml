@@ -11,7 +11,7 @@ license = "GPL-3.0-or-later"
 ratatui = "0.29"
 crossterm = "0.28"
 widgets = { path = "crates/widgets" }
-matrix-sdk = { version = "0.7", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls", "sso-login"] }
+matrix-sdk = { version = "0.14", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls", "sso-login"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 dirs = "5"
 url = "2"

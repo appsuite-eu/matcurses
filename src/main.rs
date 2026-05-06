@@ -1,3 +1,7 @@
+// matrix-sdk 0.14's deeply-monomorphized async sync stack overflows
+// rustc's default 128-deep type-resolution limit. Bump it crate-wide.
+#![recursion_limit = "256"]
+
 mod app;
 mod audio;
 mod event;

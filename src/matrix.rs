@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use matrix_sdk::matrix_auth::MatrixSession;
+use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::media::{MediaFormat, MediaRequest};
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
+use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::room::{MessagesOptions, RoomMember};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
@@ -905,7 +906,10 @@ async fn build_and_restore(
         .await?;
     let json = std::fs::read_to_string(session_path)?;
     let session: MatrixSession = serde_json::from_str(&json)?;
-    client.matrix_auth().restore_session(session).await?;
+    client
+        .matrix_auth()
+        .restore_session(session, RoomLoadSettings::default())
+        .await?;
     Ok(client)
 }
 
@@ -978,7 +982,7 @@ async fn fetch_presence(
     use matrix_sdk::ruma::OwnedUserId;
     let user_id: OwnedUserId = mxid.parse()?;
     let request = get_presence::v3::Request::new(user_id);
-    let response = client.send(request, None).await?;
+    let response = client.send(request).await?;
     Ok(map_presence(&response.presence))
 }
 
@@ -993,12 +997,25 @@ fn map_presence(p: &matrix_sdk::ruma::presence::PresenceState) -> UiPresence {
 }
 
 fn map_member(m: &RoomMember) -> UiMember {
+    use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
     let mxid = m.user_id().to_string();
     let displayname = m
         .display_name()
         .map(|s| s.to_string())
         .unwrap_or_else(|| m.user_id().localpart().to_string());
-    let power_level = m.power_level().clamp(0, 100) as u8;
+    // `power_level()` now returns `UserPowerLevel` (Infinite | Int(Int))
+    // instead of a raw integer; clamp the integer variant to [0, 100] so it
+    // fits in the UI byte. "Infinite" (room creator under room v12) → 100.
+    let power_level = match m.power_level() {
+        UserPowerLevel::Infinite => 100u8,
+        UserPowerLevel::Int(n) => {
+            let raw: i64 = n.into();
+            raw.clamp(0, 100) as u8
+        }
+        // The enum is `#[non_exhaustive]`; future ruma additions get a
+        // sane "user-tier" mapping until we know what they mean.
+        _ => 0,
+    };
     // Presence is not exposed directly on RoomMember in matrix-sdk 0.7:
     // it depends on a separate API and isn't always populated. Default to
     // Unavailable for now; we can wire the presence API later.
@@ -1429,7 +1446,7 @@ async fn run_sync(
                 // bridge re-encrypted asynchronously.
                 let cur_id = cur.lock().await.clone();
                 if let Some(rid) = cur_id {
-                    if let Some(joined) = response.rooms.join.get(&rid) {
+                    if let Some(joined) = response.rooms.joined.get(&rid) {
                         if !joined.timeline.events.is_empty() {
                             let _ = load_room_messages(&c, &rid.to_string(), &tx).await;
                         }
@@ -1495,7 +1512,9 @@ async fn load_room_messages(
         RoomState::Invited => {
             room.join().await?;
         }
-        RoomState::Left => return Err("room quittée".into()),
+        RoomState::Left | RoomState::Knocked | RoomState::Banned => {
+            return Err("room non accessible".into());
+        }
     }
 
     let mut opts = MessagesOptions::backward();
@@ -1510,15 +1529,19 @@ async fn load_room_messages(
         .map(|u| u.to_string())
         .unwrap_or_default();
 
-    use matrix_sdk::ruma::events::AnyTimelineEvent;
+    use matrix_sdk::ruma::events::AnySyncTimelineEvent;
     use std::collections::HashMap;
 
     // Walk events in chronological (oldest → newest) order.
-    let events: Vec<AnyTimelineEvent> = chunk
+    // Since matrix-sdk 0.8 the timeline-event wrapper exposes the raw JSON
+    // through `.raw()` (instead of an `event` field) and only types it as
+    // `AnySyncTimelineEvent`; the `room_id` field that distinguishes
+    // `AnyTimelineEvent` is unused on this path.
+    let events: Vec<AnySyncTimelineEvent> = chunk
         .chunk
         .iter()
         .rev()
-        .filter_map(|tev| tev.event.deserialize().ok())
+        .filter_map(|tev| tev.raw().deserialize().ok())
         .collect();
 
     // Pass 1: extract top-level RoomMessages and undecryptable placeholders.
@@ -1527,7 +1550,7 @@ async fn load_room_messages(
     let mut idx_by_event: HashMap<String, usize> = HashMap::new();
 
     for raw in &events {
-        if let AnyTimelineEvent::MessageLike(ml) = raw {
+        if let AnySyncTimelineEvent::MessageLike(ml) = raw {
             let event_id = ml.event_id().to_string();
             let sender = ml.sender().to_string();
             let ts = ml.origin_server_ts();
@@ -1569,7 +1592,7 @@ async fn load_room_messages(
 
     // Pass 2: attach thread replies and reactions to their parent message.
     for raw in &events {
-        if let AnyTimelineEvent::MessageLike(ml) = raw {
+        if let AnySyncTimelineEvent::MessageLike(ml) = raw {
             let event_id = ml.event_id().to_string();
             let sender = ml.sender().to_string();
             let ts = ml.origin_server_ts();
@@ -1942,12 +1965,12 @@ async fn download_voice(
     let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
     let parsed_event: OwnedEventId = event_id.parse()?;
 
-    let timeline_event = room.event(&parsed_event).await?;
-    let raw = timeline_event.event.deserialize()?;
+    let timeline_event = room.event(&parsed_event, None).await?;
+    let raw = timeline_event.raw().deserialize()?;
 
-    use matrix_sdk::ruma::events::AnyTimelineEvent;
+    use matrix_sdk::ruma::events::AnySyncTimelineEvent;
     let (source, mime) = match raw {
-        AnyTimelineEvent::MessageLike(ml) => match ml.original_content() {
+        AnySyncTimelineEvent::MessageLike(ml) => match ml.original_content() {
             Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => match rmc.msgtype {
                 MessageType::Audio(audio) => {
                     let mime = audio.info.as_ref().and_then(|i| i.mimetype.clone());
@@ -1960,7 +1983,7 @@ async fn download_voice(
         _ => return Err("event inattendu".into()),
     };
 
-    let request = MediaRequest {
+    let request = MediaRequestParameters {
         source,
         format: MediaFormat::File,
     };
