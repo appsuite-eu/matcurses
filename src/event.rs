@@ -464,7 +464,15 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> EventOutcome {
                 app.flash = Some("ouverture documentation (mock)".into());
             }
             settings_view::F_SAVE => {
-                app.flash = Some("paramètres enregistrés (mock)".into());
+                match app.settings_state.save() {
+                    Ok(path) => {
+                        app.flash =
+                            Some(format!("paramètres enregistrés : {}", path.display()));
+                    }
+                    Err(e) => {
+                        app.flash = Some(format!("enregistrement KO : {e}"));
+                    }
+                }
                 app.back_to_conversation();
             }
             settings_view::F_CANCEL => {
@@ -487,6 +495,7 @@ fn toggle_settings_field(s: &mut SettingsState) {
         settings_view::F_KEYCHAIN => s.keychain_recovery = !s.keychain_recovery,
         settings_view::F_SOUNDS => s.sounds = !s.sounds,
         settings_view::F_MULTILINE => s.multi_line_input = !s.multi_line_input,
+        settings_view::F_REOPEN => s.reopen_windows = !s.reopen_windows,
         _ => {}
     }
 }

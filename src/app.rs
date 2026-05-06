@@ -227,6 +227,11 @@ pub struct App {
     /// while focused.
     pub windows: Vec<ChatWindow>,
     pub active_window: usize,
+    /// Room IDs to re-open after the next sync completes (driven by
+    /// `settings_state.reopen_windows`). Cleared once consumed.
+    pub pending_reopen: Vec<String>,
+    /// Active window index to restore after re-opening pending rooms.
+    pub pending_reopen_active: usize,
 }
 
 impl App {
@@ -262,7 +267,13 @@ impl App {
             pending_completion: None,
             windows: vec![ChatWindow::empty()],
             active_window: 0,
+            pending_reopen: Vec::new(),
+            pending_reopen_active: 0,
         };
+        if s.settings_state.reopen_windows && !s.settings_state.last_windows.is_empty() {
+            s.pending_reopen = s.settings_state.last_windows.clone();
+            s.pending_reopen_active = s.settings_state.last_active;
+        }
         // Try to restore a previously-persisted session on startup, so the
         // user doesn't have to log in again every time.
         if let Some(b) = &s.matrix {
@@ -310,7 +321,25 @@ impl App {
             // Fetch and apply pending Matrix updates.
             self.apply_matrix_updates();
         }
+        // Persist the open-window list so the next start can restore it
+        // (only when the corresponding setting is on; otherwise clear).
+        self.persist_session();
         Ok(())
+    }
+
+    fn persist_session(&mut self) {
+        if self.settings_state.reopen_windows {
+            self.settings_state.last_windows = self
+                .windows
+                .iter()
+                .filter_map(|w| w.room_id.clone())
+                .collect();
+            self.settings_state.last_active = self.active_window;
+        } else {
+            self.settings_state.last_windows.clear();
+            self.settings_state.last_active = 0;
+        }
+        let _ = self.settings_state.save();
     }
 
     fn next_timeout(&self) -> Duration {
@@ -1689,7 +1718,23 @@ impl App {
                 self.flash = Some(reason);
             }
             MxUpdate::SyncComplete => {
-                // Nothing to do for now — we already received Rooms just before.
+                // Drain any pending re-open list so the user finds their
+                // last session's windows back. This runs once: the list
+                // is moved out before iterating.
+                if !self.pending_reopen.is_empty() {
+                    let to_open = std::mem::take(&mut self.pending_reopen);
+                    let target_active = self.pending_reopen_active.min(to_open.len().saturating_sub(1));
+                    for id in &to_open {
+                        self.switch_room(id);
+                    }
+                    if target_active < self.windows.len() {
+                        self.switch_window(target_active);
+                    }
+                    self.flash = Some(format!(
+                        "{} fenêtre(s) restaurée(s)",
+                        to_open.len()
+                    ));
+                }
             }
             MxUpdate::Members { room_id, members } => {
                 // Only accept the update if it matches the room

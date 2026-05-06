@@ -6,7 +6,7 @@ use ratatui::{
 };
 use widgets::{render_form, FormField};
 
-pub const FIELD_COUNT: usize = 12;
+pub const FIELD_COUNT: usize = 13;
 
 pub const F_TTS: usize = 0;
 pub const F_NATO: usize = 1;
@@ -17,9 +17,10 @@ pub const F_KEYCHAIN: usize = 5;
 pub const F_PM_CMD: usize = 6;
 pub const F_SOUNDS: usize = 7;
 pub const F_MULTILINE: usize = 8;
-pub const F_DOC: usize = 9;
-pub const F_SAVE: usize = 10;
-pub const F_CANCEL: usize = 11;
+pub const F_REOPEN: usize = 9;
+pub const F_DOC: usize = 10;
+pub const F_SAVE: usize = 11;
+pub const F_CANCEL: usize = 12;
 
 const SAS_OPTIONS: &[&str] = &["Décimal", "Emoji (noms)"];
 const VOICE_OPTIONS: &[&str] = &[
@@ -27,6 +28,7 @@ const VOICE_OPTIONS: &[&str] = &[
     "Push-to-talk (maintien)",
 ];
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SettingsState {
     pub tts: bool,
     pub nato: bool,
@@ -50,11 +52,27 @@ pub struct SettingsState {
     /// When on, Entrée insère un saut de ligne dans la barre de saisie
     /// et Ctrl+S envoie. Sinon, Entrée envoie directement.
     pub multi_line_input: bool,
+    /// If on, the room IDs of the open windows are persisted on quit
+    /// and re-opened on next start.
+    #[serde(default)]
+    pub reopen_windows: bool,
+    /// Snapshot of the open windows' room IDs as of the last quit.
+    /// Read once at startup when `reopen_windows` is on.
+    #[serde(default)]
+    pub last_windows: Vec<String>,
+    /// Index of the active window at the last quit.
+    #[serde(default)]
+    pub last_active: usize,
+    #[serde(skip)]
     pub focus_idx: usize,
 }
 
 impl SettingsState {
     pub fn new() -> Self {
+        Self::load().unwrap_or_else(Self::defaults)
+    }
+
+    fn defaults() -> Self {
         Self {
             tts: true,
             nato: true,
@@ -65,8 +83,34 @@ impl SettingsState {
             pm_cmd: String::new(),
             sounds: true,
             multi_line_input: false,
+            reopen_windows: true,
+            last_windows: Vec::new(),
+            last_active: 0,
             focus_idx: 0,
         }
+    }
+
+    /// Load persisted settings from `~/.config/matcurses/settings.toml`
+    /// (or the platform-equivalent config dir). Returns None if the file
+    /// is missing or unparseable; the caller falls back to defaults.
+    pub fn load() -> Option<Self> {
+        let path = settings_path()?;
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let mut s: Self = toml::from_str(&raw).ok()?;
+        s.focus_idx = 0;
+        Some(s)
+    }
+
+    /// Persist the current settings to disk. Returns the human-readable
+    /// path on success so the caller can flash it.
+    pub fn save(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        let path = settings_path().ok_or("pas de répertoire de config")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml = toml::to_string_pretty(self)?;
+        std::fs::write(&path, toml)?;
+        Ok(path)
     }
 
     pub fn next(&mut self) {
@@ -76,6 +120,10 @@ impl SettingsState {
     pub fn prev(&mut self) {
         self.focus_idx = (self.focus_idx + FIELD_COUNT - 1) % FIELD_COUNT;
     }
+}
+
+fn settings_path() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("matcurses").join("settings.toml"))
 }
 
 pub fn render(frame: &mut Frame, area: Rect, s: &SettingsState) -> (u16, u16) {
@@ -135,6 +183,10 @@ pub fn render(frame: &mut Frame, area: Rect, s: &SettingsState) -> (u16, u16) {
         FormField::Checkbox {
             label: "Saisie multi-ligne (Entrée = saut de ligne, Ctrl+S = envoyer)",
             checked: s.multi_line_input,
+        },
+        FormField::Checkbox {
+            label: "Rouvrir les dernières fenêtres au démarrage",
+            checked: s.reopen_windows,
         },
         FormField::Spacer,
         FormField::Link {
