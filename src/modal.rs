@@ -60,6 +60,21 @@ pub enum Modal {
     RecoveryInput(RecoveryInputModal),
     RecoveryDisplay(RecoveryDisplayModal),
     SasVerification(SasVerificationModal),
+    WindowList(WindowListModal),
+}
+
+pub struct WindowListEntry {
+    pub idx: usize,
+    pub label: String,
+    /// One char to indicate background activity: ' ' none, '+' new
+    /// messages, '!' mention.
+    pub activity: char,
+    pub is_active: bool,
+}
+
+pub struct WindowListModal {
+    pub entries: Vec<WindowListEntry>,
+    pub selected: usize,
 }
 
 pub struct SasVerificationModal {
@@ -106,7 +121,47 @@ pub fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) -> ModalCursor {
         Modal::RecoveryInput(m) => draw_recovery_input(frame, area, m),
         Modal::RecoveryDisplay(m) => draw_recovery_display(frame, area, m),
         Modal::SasVerification(m) => draw_sas_verification(frame, area, m),
+        Modal::WindowList(m) => draw_window_list(frame, area, m),
     }
+}
+
+fn draw_window_list(frame: &mut Frame, area: Rect, m: &WindowListModal) -> ModalCursor {
+    let max_w = m
+        .entries
+        .iter()
+        .map(|e| e.label.chars().count())
+        .max()
+        .unwrap_or(20)
+        + 8;
+    let h = (m.entries.len() as u16 + 4).min(area.height);
+    let popup = centered_rect(area, (max_w as u16).max(36), h.max(6));
+    let inner = render_modal_frame(
+        frame,
+        popup,
+        &ModalFrame {
+            title: "Fenêtres",
+            footer: Some("↑↓: choisir · Entrée: ouvrir · Esc: fermer"),
+        },
+    );
+
+    let rows: Vec<ListRow> = m
+        .entries
+        .iter()
+        .map(|e| {
+            let active_marker = if e.is_active { '>' } else { ' ' };
+            // " >NN<act> name" — column 4 is the first letter of the label.
+            let text = format!("{}{:>2}{} {}", active_marker, e.idx + 1, e.activity, e.label);
+            ListRow::new(text)
+                .cursor_col(5)
+                .bold(e.activity == '!')
+        })
+        .collect();
+    let mut state = ListState {
+        selected: m.selected,
+        scroll_top: 0,
+    };
+    let (cx, cy) = render_list(frame, inner, &rows, &mut state, None);
+    ModalCursor { x: cx, y: cy }
 }
 
 fn draw_confirm(frame: &mut Frame, area: Rect, m: &ConfirmModal) -> ModalCursor {

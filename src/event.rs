@@ -154,6 +154,19 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             }
             _ => {}
         },
+        Modal::WindowList(w) => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_modal(),
+            KeyCode::Up => w.selected = w.selected.saturating_sub(1),
+            KeyCode::Down => {
+                w.selected = (w.selected + 1).min(w.entries.len().saturating_sub(1));
+            }
+            KeyCode::Home | KeyCode::Char('g') => w.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                w.selected = w.entries.len().saturating_sub(1);
+            }
+            KeyCode::Enter => app.pick_window_from_list(),
+            _ => {}
+        },
         Modal::SasVerification(s) => match key.code {
             KeyCode::Esc => app.sas_cancel(),
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {

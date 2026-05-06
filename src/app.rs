@@ -46,7 +46,7 @@ impl SearchState {
 use crate::modal::{
     ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal, ReactedByModal,
     ReactionPickerModal, RecoveryDisplayFocus, RecoveryDisplayModal, RecoveryFocus,
-    RecoveryInputModal, SasVerificationModal,
+    RecoveryInputModal, SasVerificationModal, WindowListEntry, WindowListModal,
 };
 use crate::ui::draw;
 use crate::view::login::LoginState;
@@ -121,6 +121,9 @@ const SLASH_COMMANDS: &[&str] = &[
     "enable-recovery",
     "verify",
     "logout",
+    "window",
+    "win",
+    "w",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +785,52 @@ impl App {
         }
     }
 
+    pub fn open_window_list(&mut self) {
+        let entries: Vec<WindowListEntry> = self
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let activity = match w.activity {
+                    ActivityLevel::None => ' ',
+                    ActivityLevel::Active => '+',
+                    ActivityLevel::Mention => '!',
+                };
+                let label = if w.room_name.is_empty() {
+                    "(vide)".to_string()
+                } else {
+                    w.room_name.clone()
+                };
+                WindowListEntry {
+                    idx: i,
+                    label,
+                    activity,
+                    is_active: i == self.active_window,
+                }
+            })
+            .collect();
+        let selected = self.active_window;
+        self.modal = Some(Modal::WindowList(WindowListModal {
+            entries,
+            selected,
+        }));
+    }
+
+    pub fn pick_window_from_list(&mut self) {
+        let target = match &self.modal {
+            Some(Modal::WindowList(m)) => m
+                .entries
+                .get(m.selected)
+                .map(|e| e.idx),
+            _ => None,
+        };
+        self.modal = None;
+        if let Some(idx) = target {
+            self.switch_window(idx);
+            self.view = View::Conversation;
+        }
+    }
+
     pub fn next_window(&mut self) {
         if self.windows.is_empty() {
             return;
@@ -858,12 +907,19 @@ impl App {
             return;
         }
 
-        // Open the room in the current window if it is empty (no room yet),
-        // otherwise create a new window.
+        // Decide whether to reuse the active window or create a new one.
+        // We look at the LIVE state (`current_room_id`), not the stored
+        // window slot — the active slot's `room_id` is only updated on a
+        // save_active_window, which happens on switch.
+        let active_is_unused = self.current_room_id.is_none();
         let target = if self.windows.is_empty() {
-            self.windows.push(ChatWindow::empty());
+            self.windows.push(ChatWindow {
+                room_id: Some(id.clone()),
+                room_name: display.clone(),
+                ..ChatWindow::empty()
+            });
             0
-        } else if self.windows[self.active_window].room_id.is_none() {
+        } else if active_is_unused {
             self.active_window
         } else {
             self.save_active_window();
@@ -875,7 +931,6 @@ impl App {
             self.windows.len() - 1
         };
 
-        // Reset top-level state for the new (or repurposed) active window.
         if target != self.active_window {
             self.active_window = target;
         }
@@ -885,9 +940,24 @@ impl App {
         self.expanded_threads.clear();
         self.selected = 0;
         self.scroll_top = 0;
+        // Persist the room into the active slot immediately so the next
+        // switch_room sees this window as "occupied" and creates a new
+        // one instead of overwriting.
+        if let Some(w) = self.windows.get_mut(target) {
+            w.room_id = Some(id.clone());
+            w.room_name = display.clone();
+        }
 
         if let Some(b) = self.matrix.as_ref() {
-            b.send(MxCommand::OpenRoom { room_id: id });
+            b.send(MxCommand::OpenRoom {
+                room_id: id.clone(),
+            });
+            // Pre-fetch the member list so @user Tab-completion works
+            // without the user having to open F5 first. Stale members
+            // from the previous room are dropped immediately.
+            self.members_state.members.clear();
+            self.members_state.set_selected(0);
+            b.send(MxCommand::LoadMembers { room_id: id });
         }
         self.flash = Some(format!("ouverture {}", display));
         self.view = View::Conversation;
@@ -1273,26 +1343,7 @@ impl App {
             "window" | "win" | "w" => {
                 let arg = args.trim();
                 match arg {
-                    "" | "list" => {
-                        let mut lines = vec![format!(
-                            "Fenêtres ouvertes : {}",
-                            self.windows.len()
-                        )];
-                        for (i, w) in self.windows.iter().enumerate() {
-                            let mark = if i == self.active_window {
-                                "*"
-                            } else {
-                                " "
-                            };
-                            let label = if w.room_name.is_empty() {
-                                "(vide)".to_string()
-                            } else {
-                                w.room_name.clone()
-                            };
-                            lines.push(format!("{}{}: {}", mark, i + 1, label));
-                        }
-                        self.flash = Some(lines.join(" · "));
-                    }
+                    "" | "list" => self.open_window_list(),
                     "next" | "n" => self.next_window(),
                     "prev" | "p" | "previous" => self.prev_window(),
                     other => match other.parse::<usize>() {
