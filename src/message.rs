@@ -20,6 +20,8 @@ pub struct ThreadReply {
     pub author: String,
     pub blocks: Vec<Block>,
     pub event_id: String,
+    pub timestamp_ms: u64,
+    pub read: bool,
 }
 
 pub struct Message {
@@ -29,6 +31,8 @@ pub struct Message {
     pub replies: Vec<ThreadReply>,
     pub reactions: Vec<Reaction>,
     pub event_id: String,
+    pub timestamp_ms: u64,
+    pub read: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

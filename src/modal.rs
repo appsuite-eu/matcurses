@@ -46,17 +46,10 @@ pub struct ReactionPickerModal {
     pub selected: usize,
 }
 
-pub struct ReactedByModal {
-    pub title: String,
-    pub entries: Vec<String>,
-    pub selected: usize,
-}
-
 pub enum Modal {
     Confirm(ConfirmModal),
     Details(DetailsModal),
     ReactionPicker(ReactionPickerModal),
-    ReactedBy(ReactedByModal),
     RecoveryInput(RecoveryInputModal),
     RecoveryDisplay(RecoveryDisplayModal),
     SasVerification(SasVerificationModal),
@@ -117,7 +110,6 @@ pub fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) -> ModalCursor {
         Modal::Confirm(m) => draw_confirm(frame, area, m),
         Modal::Details(m) => draw_details(frame, area, m),
         Modal::ReactionPicker(m) => draw_reaction_picker(frame, area, m),
-        Modal::ReactedBy(m) => draw_reacted_by(frame, area, m),
         Modal::RecoveryInput(m) => draw_recovery_input(frame, area, m),
         Modal::RecoveryDisplay(m) => draw_recovery_display(frame, area, m),
         Modal::SasVerification(m) => draw_sas_verification(frame, area, m),
@@ -618,46 +610,3 @@ fn draw_recovery_input(
     ModalCursor { x, y }
 }
 
-fn draw_reacted_by(frame: &mut Frame, area: Rect, m: &ReactedByModal) -> ModalCursor {
-    let max_w = m
-        .entries
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(20)
-        .max(m.title.chars().count())
-        + 4;
-    let h = (m.entries.len() as u16 + 4).min(area.height);
-    let popup = centered_rect(area, (max_w as u16).max(30), h.max(5));
-    let inner = render_modal_frame(
-        frame,
-        popup,
-        &ModalFrame {
-            title: &m.title,
-            footer: Some("↑↓: parcourir · Esc: fermer"),
-        },
-    );
-
-    if m.entries.is_empty() {
-        frame.render_widget(
-            Paragraph::new("Aucune réaction sur ce message."),
-            inner,
-        );
-        return ModalCursor {
-            x: inner.x,
-            y: inner.y,
-        };
-    }
-
-    let rows: Vec<ListRow> = m
-        .entries
-        .iter()
-        .map(|e| ListRow::new(format!("  {}", e)).cursor_col(2))
-        .collect();
-    let mut state = ListState {
-        selected: m.selected,
-        scroll_top: 0,
-    };
-    let (cx, cy) = render_list(frame, inner, &rows, &mut state, None);
-    ModalCursor { x: cx, y: cy }
-}

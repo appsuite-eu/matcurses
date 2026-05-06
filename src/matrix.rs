@@ -45,7 +45,14 @@ pub enum Command {
     /// The user selected a room in the list — load its contents.
     OpenRoom { room_id: String },
     /// Send a text message to the active room (user pressed Enter).
-    SendMessage { room_id: String, body: String },
+    /// `reply_to` and `thread_root` populate the corresponding
+    /// `m.relates_to` relation when set.
+    SendMessage {
+        room_id: String,
+        body: String,
+        reply_to: Option<String>,
+        thread_root: Option<String>,
+    },
     /// Force a refresh of the rooms list.
     #[allow(dead_code)]
     RefreshRooms,
@@ -478,12 +485,12 @@ async fn matrix_main(
                     });
                 }
             }
-            Command::SendMessage { room_id, body } => {
+            Command::SendMessage { room_id, body, reply_to, thread_root } => {
                 if let Some(c) = &client {
                     let tx = update_tx.clone();
                     let c = c.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = do_send(&c, &room_id, &body).await {
+                        if let Err(e) = do_send(&c, &room_id, &body, reply_to, thread_root).await {
                             let _ = tx
                                 .send(Update::Error {
                                     reason: format!("envoi : {e}"),
@@ -1549,6 +1556,8 @@ async fn load_room_messages(
                         replies: Vec::new(),
                         reactions: Vec::new(),
                         event_id: event_id.clone(),
+                        timestamp_ms: ts.0.into(),
+                        read: false,
                     };
                     idx_by_event.insert(event_id.clone(), out.len());
                     out.push(m);
@@ -1576,6 +1585,8 @@ async fn load_room_messages(
                                 author: short_author(&sender),
                                 blocks: msgtype_to_blocks(&rmc.msgtype),
                                 event_id,
+                                timestamp_ms: ts.0.into(),
+                                read: false,
                             };
                             out[idx].replies.push(reply);
                         }
@@ -1608,6 +1619,16 @@ async fn load_room_messages(
                 }
                 _ => {}
             }
+        }
+    }
+
+    // Historical batch: mark every message + reply as already read so
+    // the user's `u` (next-unread) only walks messages that arrived
+    // live during the current matcurses session.
+    for msg in &mut out {
+        msg.read = true;
+        for r in &mut msg.replies {
+            r.read = true;
         }
     }
 
@@ -1848,21 +1869,50 @@ async fn enable_recovery(
 }
 
 /// Send a plain text message into the room.
+///
+/// `reply_to` and `thread_root` populate `m.relates_to` so Element / other
+/// clients render the bubble as a reply or as a thread message. Thread takes
+/// precedence (it embeds the reply relation under `is_falling_back`).
 async fn do_send(
     client: &Client,
     room_id: &str,
     body: &str,
+    reply_to: Option<String>,
+    thread_root: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
+    use matrix_sdk::ruma::events::room::message::Relation;
     let parsed: OwnedRoomId = room_id.parse()?;
     let room = client
         .get_room(&parsed)
         .ok_or("room introuvable pour send")?;
-    let content = RoomMessageEventContent::text_plain(body);
+    let mut content = RoomMessageEventContent::text_plain(body);
+    if let Some(root) = thread_root {
+        let root_id: OwnedEventId = root.parse()?;
+        let reply_target: OwnedEventId = match reply_to {
+            Some(id) => id.parse()?,
+            None => root_id.clone(),
+        };
+        // `Thread::plain` constructs a thread relation whose `in_reply_to`
+        // points at the previous message; we then flip `is_falling_back`
+        // so thread-aware clients (Element) treat the rich-reply purely
+        // as a fallback for legacy clients.
+        let mut thread = Thread::plain(root_id, reply_target);
+        thread.is_falling_back = true;
+        content.relates_to = Some(Relation::Thread(thread));
+    } else if let Some(id) = reply_to {
+        let event_id: OwnedEventId = id.parse()?;
+        content.relates_to = Some(Relation::Reply {
+            in_reply_to: InReplyTo::new(event_id),
+        });
+    }
     room.send(content).await?;
     Ok(())
 }
 
-/// Convert an `m.room.message` event content to our UI `Message`.
+/// Convert an `m.room.message` event content to our UI `Message`. Live
+/// arrivals start `read: false`; historical loads mark them `true`
+/// after the batch is built (see `load_room_messages`).
 fn event_content_to_message(
     event_id: &str,
     sender: &str,
@@ -1876,6 +1926,8 @@ fn event_content_to_message(
         replies: Vec::new(),
         reactions: Vec::new(),
         event_id: event_id.to_string(),
+        timestamp_ms: ts_ms,
+        read: false,
     }
 }
 

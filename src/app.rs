@@ -44,7 +44,7 @@ impl SearchState {
     }
 }
 use crate::modal::{
-    ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal, ReactedByModal,
+    ConfirmAction, ConfirmButton, ConfirmModal, DetailsModal, Modal,
     ReactionPickerModal, RecoveryDisplayFocus, RecoveryDisplayModal, RecoveryFocus,
     RecoveryInputModal, SasVerificationModal, WindowListEntry, WindowListModal,
 };
@@ -232,6 +232,12 @@ pub struct App {
     pub pending_reopen: Vec<String>,
     /// Active window index to restore after re-opening pending rooms.
     pub pending_reopen_active: usize,
+    /// Event id of the message the next outgoing message replies to
+    /// (`m.in_reply_to`). Cleared on send and on Esc from the input bar.
+    pub reply_to: Option<String>,
+    /// Event id of the thread root the next outgoing message attaches to
+    /// (`m.thread`). Takes precedence over a bare reply.
+    pub thread_root: Option<String>,
 }
 
 impl App {
@@ -269,6 +275,8 @@ impl App {
             active_window: 0,
             pending_reopen: Vec::new(),
             pending_reopen_active: 0,
+            reply_to: None,
+            thread_root: None,
         };
         if s.settings_state.reopen_windows && !s.settings_state.last_windows.is_empty() {
             s.pending_reopen = s.settings_state.last_windows.clone();
@@ -387,6 +395,7 @@ impl App {
 
     pub fn select_prev(&mut self, n: usize) {
         self.selected = self.selected.saturating_sub(n);
+        self.mark_current_read();
         self.update_status();
     }
 
@@ -394,18 +403,153 @@ impl App {
         let len = self.visible_items().len();
         let max = len.saturating_sub(1);
         self.selected = (self.selected + n).min(max);
+        self.mark_current_read();
         self.update_status();
     }
 
     pub fn select_first(&mut self) {
         self.selected = 0;
+        self.mark_current_read();
         self.update_status();
     }
 
     pub fn select_last(&mut self) {
         let len = self.visible_items().len();
         self.selected = len.saturating_sub(1);
+        self.mark_current_read();
         self.update_status();
+    }
+
+    /// Mark the message under the cursor as read (no-op if already).
+    pub fn mark_current_read(&mut self) {
+        let item = match self.current_item() {
+            Some(it) => it,
+            None => return,
+        };
+        match item.kind {
+            ItemKind::Top => {
+                if let Some(m) = self.messages.get_mut(item.msg_idx) {
+                    m.read = true;
+                }
+            }
+            ItemKind::Reply => {
+                if let Some(m) = self.messages.get_mut(item.msg_idx) {
+                    if let Some(r) = m.replies.get_mut(item.reply_idx) {
+                        r.read = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump to the next unread message in the current room. Wraps around
+    /// to the start of the buffer if no later unread is found.
+    pub fn select_next_unread(&mut self) {
+        let visible = self.visible_items();
+        let len = visible.len();
+        if len == 0 {
+            return;
+        }
+        for i in 1..=len {
+            let idx = (self.selected + i) % len;
+            if !self.is_item_read(&visible[idx]) {
+                self.selected = idx;
+                self.mark_current_read();
+                self.update_status();
+                return;
+            }
+        }
+        self.flash = Some("aucun message non lu".into());
+    }
+
+    /// Jump to the first message of the next calendar day (local TZ),
+    /// relative to the focused message.
+    pub fn select_next_date(&mut self) {
+        let visible = self.visible_items();
+        let current = match self.current_item() {
+            Some(it) => self.item_date_bucket(&it),
+            None => return,
+        };
+        for i in self.selected + 1..visible.len() {
+            let bucket = self.item_date_bucket(&visible[i]);
+            if bucket.is_some() && bucket != current {
+                self.selected = i;
+                self.mark_current_read();
+                self.update_status();
+                return;
+            }
+        }
+        self.flash = Some("pas de date suivante".into());
+    }
+
+    /// Jump to the first message of the previous calendar day relative
+    /// to the focused message.
+    pub fn select_prev_date(&mut self) {
+        let visible = self.visible_items();
+        let current = match self.current_item() {
+            Some(it) => self.item_date_bucket(&it),
+            None => return,
+        };
+        // Walk back, find the last item before the current bucket; once
+        // we crossed the boundary, keep going to the FIRST item of that
+        // earlier day so the cursor lands on the day's start.
+        let mut crossed: Option<chrono::NaiveDate> = None;
+        for i in (0..self.selected).rev() {
+            let bucket = self.item_date_bucket(&visible[i]);
+            match (crossed, bucket) {
+                (None, Some(b)) if Some(b) != current => crossed = Some(b),
+                (Some(prev), Some(b)) if b != prev => {
+                    // Reached an even-earlier day: stop at the first of `prev`.
+                    self.selected = i + 1;
+                    self.mark_current_read();
+                    self.update_status();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Some(_b) = crossed {
+            self.selected = 0;
+            self.mark_current_read();
+            self.update_status();
+        } else {
+            self.flash = Some("pas de date précédente".into());
+        }
+    }
+
+    fn is_item_read(&self, item: &ViewItem) -> bool {
+        match item.kind {
+            ItemKind::Top => self
+                .messages
+                .get(item.msg_idx)
+                .map(|m| m.read)
+                .unwrap_or(true),
+            ItemKind::Reply => self
+                .messages
+                .get(item.msg_idx)
+                .and_then(|m| m.replies.get(item.reply_idx))
+                .map(|r| r.read)
+                .unwrap_or(true),
+        }
+    }
+
+    fn item_date_bucket(&self, item: &ViewItem) -> Option<chrono::NaiveDate> {
+        use chrono::TimeZone;
+        let ts = match item.kind {
+            ItemKind::Top => self.messages.get(item.msg_idx)?.timestamp_ms,
+            ItemKind::Reply => {
+                self.messages
+                    .get(item.msg_idx)?
+                    .replies
+                    .get(item.reply_idx)?
+                    .timestamp_ms
+            }
+        };
+        if ts == 0 {
+            return None;
+        }
+        let dt = chrono::Local.timestamp_millis_opt(ts as i64).single()?;
+        Some(dt.date_naive())
     }
 
     pub fn open_thread(&mut self) {
@@ -557,27 +701,6 @@ impl App {
         self.modal = Some(Modal::ReactionPicker(ReactionPickerModal {
             msg_idx: item.msg_idx,
             options: REACTION_OPTIONS.iter().map(|s| s.to_string()).collect(),
-            selected: 0,
-        }));
-    }
-
-    pub fn open_reacted_by(&mut self) {
-        let item = match self.current_item() {
-            Some(it) => it,
-            None => return,
-        };
-        if item.kind != ItemKind::Top {
-            return;
-        }
-        let msg = &self.messages[item.msg_idx];
-        let entries: Vec<String> = msg
-            .reactions
-            .iter()
-            .map(|r| format!("{} — {}", r.key, r.users.join(", ")))
-            .collect();
-        self.modal = Some(Modal::ReactedBy(ReactedByModal {
-            title: "Qui a réagi".into(),
-            entries,
             selected: 0,
         }));
     }
@@ -1308,7 +1431,108 @@ impl App {
             return;
         }
         if let (Some(id), Some(b)) = (self.current_room_id.clone(), self.matrix.as_ref()) {
-            b.send(MxCommand::SendMessage { room_id: id, body });
+            let reply_to = self.reply_to.clone();
+            let thread_root = self.thread_root.clone();
+            b.send(MxCommand::SendMessage {
+                room_id: id,
+                body,
+                reply_to,
+                thread_root,
+            });
+        }
+        self.clear_compose_target();
+    }
+
+    /// Drop any pending reply / thread target. Called on send and on Esc
+    /// from the input bar so the next message goes back to a fresh top-level
+    /// post.
+    pub fn clear_compose_target(&mut self) {
+        self.reply_to = None;
+        self.thread_root = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Mark the message under the cursor as the target of the next sent
+    /// message (rich-reply, `m.in_reply_to`). Switches focus to the input
+    /// bar so the user can start typing immediately.
+    pub fn start_reply(&mut self) {
+        let event_id = match self.current_event_id() {
+            Some(id) => id,
+            None => {
+                self.flash = Some("aucun message sélectionné".into());
+                return;
+            }
+        };
+        self.reply_to = Some(event_id);
+        self.thread_root = None;
+        self.input_mode = InputMode::Reply;
+        self.set_focus(Focus::Input);
+    }
+
+    /// Start (or continue) a thread rooted at the selected message. If the
+    /// cursor is on a thread reply, we use its parent message's event id as
+    /// the thread root so further replies attach to the same conversation.
+    pub fn start_thread(&mut self) {
+        let item = match self.current_item() {
+            Some(it) => it,
+            None => {
+                self.flash = Some("aucun message sélectionné".into());
+                return;
+            }
+        };
+        let (root, reply_target) = match item.kind {
+            ItemKind::Top => {
+                let m = match self.messages.get(item.msg_idx) {
+                    Some(m) => m,
+                    None => return,
+                };
+                (m.event_id.clone(), m.event_id.clone())
+            }
+            ItemKind::Reply => {
+                let m = match self.messages.get(item.msg_idx) {
+                    Some(m) => m,
+                    None => return,
+                };
+                let r = match m.replies.get(item.reply_idx) {
+                    Some(r) => r,
+                    None => return,
+                };
+                (m.event_id.clone(), r.event_id.clone())
+            }
+        };
+        if root.is_empty() {
+            self.flash = Some("événement sans id, thread impossible".into());
+            return;
+        }
+        self.thread_root = Some(root);
+        // Always falling back to a reply target so Element renders the
+        // bubble in the right thread context for the previous post.
+        self.reply_to = if reply_target.is_empty() {
+            None
+        } else {
+            Some(reply_target)
+        };
+        self.input_mode = InputMode::Thread;
+        self.set_focus(Focus::Input);
+    }
+
+    fn current_event_id(&self) -> Option<String> {
+        let item = self.current_item()?;
+        match item.kind {
+            ItemKind::Top => {
+                let id = self.messages.get(item.msg_idx)?.event_id.clone();
+                if id.is_empty() { None } else { Some(id) }
+            }
+            ItemKind::Reply => {
+                let id = self
+                    .messages
+                    .get(item.msg_idx)?
+                    .replies
+                    .get(item.reply_idx)?
+                    .event_id
+                    .clone();
+                if id.is_empty() { None } else { Some(id) }
+            }
         }
     }
 

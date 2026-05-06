@@ -146,14 +146,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             KeyCode::Enter => app.pick_reaction(),
             _ => {}
         },
-        Modal::ReactedBy(r) => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => app.close_modal(),
-            KeyCode::Up => r.selected = r.selected.saturating_sub(1),
-            KeyCode::Down => {
-                r.selected = (r.selected + 1).min(r.entries.len().saturating_sub(1));
-            }
-            _ => {}
-        },
         Modal::WindowList(w) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.close_modal(),
             KeyCode::Up => w.selected = w.selected.saturating_sub(1),
@@ -242,8 +234,13 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('q') => app.open_quit_confirm(),
         KeyCode::Char('d') => app.open_details(),
         KeyCode::Char('D') => app.open_redact_confirm(),
-        KeyCode::Char('r') => app.open_reaction_picker(),
-        KeyCode::Char('R') => app.open_reacted_by(),
+        // `r` = reply to selected message. `R` (Shift+r) = reaction picker.
+        // The "who reacted" view is reachable from the details popup (`d`).
+        KeyCode::Char('r') => app.start_reply(),
+        KeyCode::Char('R') => app.open_reaction_picker(),
+        // `t` = create a new thread (or post into the existing thread of
+        // the selected message).
+        KeyCode::Char('t') => app.start_thread(),
         KeyCode::Char('v') => app.play_current_voice(),
         KeyCode::Char('V') => app.stop_voice(),
         KeyCode::Char('e') => return EventOutcome::OpenEditor(app.current_message_text()),
@@ -263,6 +260,14 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('G') => app.select_last(),
         KeyCode::Right | KeyCode::Char('+') => app.open_thread(),
         KeyCode::Left | KeyCode::Char('-') => app.close_thread(),
+        // Window switching from the conversation focus.
+        KeyCode::Char('<') => app.prev_window(),
+        KeyCode::Char('>') => app.next_window(),
+        // Date navigation.
+        KeyCode::Char('[') => app.select_prev_date(),
+        KeyCode::Char(']') => app.select_next_date(),
+        // Next unread message in the current room.
+        KeyCode::Char('u') => app.select_next_unread(),
         _ => {}
     }
     EventOutcome::Continue
@@ -384,7 +389,12 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         app.pending_completion = None;
     }
     match key.code {
-        KeyCode::Esc => app.set_focus(Focus::Conversation),
+        KeyCode::Esc => {
+            // Drop any in-flight reply / thread target so the user is
+            // back to a clean top-level compose next time.
+            app.clear_compose_target();
+            app.set_focus(Focus::Conversation);
+        }
         // F-keys for view switches still work while typing.
         KeyCode::F(3) => app.open_spaces(),
         KeyCode::F(4) => app.open_rooms(),
