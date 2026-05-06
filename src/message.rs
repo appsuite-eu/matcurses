@@ -71,6 +71,17 @@ pub fn build_visible_items(messages: &[Message], expanded: &HashSet<usize>) -> V
 
 pub use widgets::WrappedLine;
 
+/// Snapshot of the active voice playback, passed down to `wrap_view` so the
+/// `[voix ...]` line of the matching message can render `lecture pos/dur Sx`
+/// or `pause pos/dur Sx` instead of the static "v: lire" hint.
+pub struct PlaybackHint {
+    pub msg_idx: usize,
+    pub reply_idx: Option<usize>,
+    pub pos_secs: f32,
+    pub speed: f32,
+    pub paused: bool,
+}
+
 const CONT_INDENT: &str = "  ";
 const REPLY_INDENT: &str = "  ";
 
@@ -85,12 +96,22 @@ pub fn wrap_view(
     expanded: &HashSet<usize>,
     width: u16,
     viewport_height: usize,
+    playback: Option<&PlaybackHint>,
 ) -> Vec<WrappedLine> {
     let width = width.max(1) as usize;
     let mut out = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let start = out.len();
         let msg = &messages[item.msg_idx];
+        // Per-item override for the `[voix ...]` block: only the message
+        // currently being played gets the live progress label.
+        let playback_for_item = playback.filter(|p| {
+            p.msg_idx == item.msg_idx
+                && match item.kind {
+                    ItemKind::Top => p.reply_idx.is_none(),
+                    ItemKind::Reply => p.reply_idx == Some(item.reply_idx),
+                }
+        });
         match item.kind {
             ItemKind::Top => {
                 let indicator = if msg.replies.is_empty() {
@@ -101,13 +122,29 @@ pub fn wrap_view(
                     "+"
                 };
                 let header = format!("{}{} <{}> ", indicator, msg.time, msg.author);
-                render_blocks(&mut out, idx, &header, &msg.blocks, width, CONT_INDENT);
+                render_blocks(
+                    &mut out,
+                    idx,
+                    &header,
+                    &msg.blocks,
+                    width,
+                    CONT_INDENT,
+                    playback_for_item,
+                );
             }
             ItemKind::Reply => {
                 let r = &msg.replies[item.reply_idx];
                 let header = format!("{}{} <{}> ", REPLY_INDENT, r.time, r.author);
                 let cont = format!("{}{}", REPLY_INDENT, CONT_INDENT);
-                render_blocks(&mut out, idx, &header, &r.blocks, width, &cont);
+                render_blocks(
+                    &mut out,
+                    idx,
+                    &header,
+                    &r.blocks,
+                    width,
+                    &cont,
+                    playback_for_item,
+                );
             }
         }
         // Mark the first line with the overflow indicator if the message
@@ -123,6 +160,24 @@ pub fn wrap_view(
         }
     }
     out
+}
+
+fn voice_label(duration_secs: u32, playback: Option<&PlaybackHint>) -> String {
+    let dur_m = duration_secs / 60;
+    let dur_s = duration_secs % 60;
+    match playback {
+        None => format!("[voix {}:{:02}  ·  v: lire]", dur_m, dur_s),
+        Some(p) => {
+            let pos = p.pos_secs.max(0.0) as u32;
+            let pos_m = pos / 60;
+            let pos_s = pos % 60;
+            let state = if p.paused { "pause" } else { "lecture" };
+            format!(
+                "[voix {dur_m}:{dur_s:02} · {state} {pos_m}:{pos_s:02} · {speed:.2}x]",
+                speed = p.speed,
+            )
+        }
+    }
 }
 
 fn replace_first_char(s: &mut String, new: char) {
@@ -143,6 +198,7 @@ fn render_blocks(
     blocks: &[Block],
     width: usize,
     cont_indent: &str,
+    playback: Option<&PlaybackHint>,
 ) {
     let header_len = header.chars().count();
     let cont_len = cont_indent.chars().count();
@@ -197,9 +253,7 @@ fn render_blocks(
                 }
             }
             Block::Voice { duration_secs } => {
-                let mins = duration_secs / 60;
-                let secs = duration_secs % 60;
-                let label = format!("[voix {}:{:02}  ·  v: lire]", mins, secs);
+                let label = voice_label(*duration_secs, playback);
                 if !header_emitted {
                     let combined = format!("{}{}", header, label);
                     let chars: String = combined.chars().take(width).collect();

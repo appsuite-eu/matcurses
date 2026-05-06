@@ -243,6 +243,14 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('t') => app.start_thread(),
         KeyCode::Char('v') => app.play_current_voice(),
         KeyCode::Char('V') => app.stop_voice(),
+        // Voice playback transport: Space pauses/resumes the active voice
+        // note, Esc stops it, `(` and `)` adjust speed by 0.25× (clamped
+        // 0.5..=2.0). Esc and Space stay no-ops when no voice is playing,
+        // so they don't shadow other shortcuts.
+        KeyCode::Char(' ') => app.toggle_voice_pause(),
+        KeyCode::Esc if app.voice_playing.is_some() => app.stop_voice(),
+        KeyCode::Char('(') => app.voice_adjust_speed(-0.25),
+        KeyCode::Char(')') => app.voice_adjust_speed(0.25),
         KeyCode::Char('e') => return EventOutcome::OpenEditor(app.current_message_text()),
         KeyCode::Char('/') => app.search_start(),
         KeyCode::Char('?') => app.search_start_backward(),

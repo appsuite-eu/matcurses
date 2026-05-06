@@ -183,6 +183,9 @@ enum AudioCommand {
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Stop,
+    Pause,
+    Resume,
+    SetSpeed(f32),
     /// Play a short event notification sound on a detached sink. Multiple
     /// concurrent event sounds may stack; voice-note playback is unaffected.
     PlaySound {
@@ -190,10 +193,30 @@ enum AudioCommand {
     },
 }
 
+/// Shared handle on the currently-playing voice-note sink. The audio thread
+/// owns the rodio `OutputStream` (which is `!Send`) but the `Sink` itself is
+/// `Send + Sync` and exposes `pause()`, `play()`, `set_speed()`,
+/// `get_pos()`, etc., so the UI thread can both control playback and read
+/// its position through this mutex.
+#[derive(Default)]
+pub struct AudioControl {
+    current: std::sync::Mutex<Option<rodio::Sink>>,
+}
+
+/// Snapshot of the active voice-note playback, sampled by the UI each frame.
+pub struct VoiceStatus {
+    pub pos_secs: f32,
+    pub speed: f32,
+    pub paused: bool,
+    pub finished: bool,
+}
+
 /// UI-side bridge. Owns the sender/receiver and the tokio runtime.
 pub struct MatrixBridge {
     pub cmd_tx: Sender<Command>,
     update_rx: Receiver<Update>,
+    audio_tx: std::sync::mpsc::Sender<AudioCommand>,
+    audio_control: std::sync::Arc<AudioControl>,
     /// The runtime is kept alive as long as the bridge exists.
     _runtime: Runtime,
 }
@@ -210,14 +233,46 @@ impl MatrixBridge {
         // Dedicated audio thread (rodio's OutputStream is !Send so it must
         // live on a single thread that owns it).
         let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
-        std::thread::spawn(move || audio_thread(audio_rx));
+        let audio_control = std::sync::Arc::new(AudioControl::default());
+        let audio_control_thread = audio_control.clone();
+        std::thread::spawn(move || audio_thread(audio_rx, audio_control_thread));
 
-        runtime.spawn(matrix_main(cmd_rx, update_tx, audio_tx));
+        runtime.spawn(matrix_main(cmd_rx, update_tx, audio_tx.clone()));
 
         Ok(Self {
             cmd_tx,
             update_rx,
+            audio_tx,
+            audio_control,
             _runtime: runtime,
+        })
+    }
+
+    /// Pause the active voice playback. No-op if nothing is playing.
+    pub fn voice_pause(&self) {
+        let _ = self.audio_tx.send(AudioCommand::Pause);
+    }
+
+    /// Resume the active (paused) voice playback. No-op if nothing is paused.
+    pub fn voice_resume(&self) {
+        let _ = self.audio_tx.send(AudioCommand::Resume);
+    }
+
+    /// Adjust the playback speed of the active voice (typically 0.5..=2.0).
+    pub fn voice_set_speed(&self, speed: f32) {
+        let _ = self.audio_tx.send(AudioCommand::SetSpeed(speed));
+    }
+
+    /// Snapshot the current voice playback state, or `None` if no voice
+    /// note is currently loaded into the sink.
+    pub fn voice_status(&self) -> Option<VoiceStatus> {
+        let guard = self.audio_control.current.lock().ok()?;
+        let sink = guard.as_ref()?;
+        Some(VoiceStatus {
+            pos_secs: sink.get_pos().as_secs_f32(),
+            speed: sink.speed(),
+            paused: sink.is_paused(),
+            finished: sink.empty(),
         })
     }
 
@@ -242,23 +297,29 @@ impl MatrixBridge {
 
 /// Audio playback thread: owns the rodio OutputStream and processes
 /// AudioCommands one at a time. Runs until the channel is closed.
-fn audio_thread(rx: std::sync::mpsc::Receiver<AudioCommand>) {
+fn audio_thread(
+    rx: std::sync::mpsc::Receiver<AudioCommand>,
+    control: std::sync::Arc<AudioControl>,
+) {
     let stream_pair = match rodio::OutputStream::try_default() {
         Ok(p) => p,
         Err(_) => return, // No audio device — silently drop further commands.
     };
     let (_stream, handle) = stream_pair;
-    let mut current: Option<rodio::Sink> = None;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             AudioCommand::Play { bytes, ack } => {
-                if let Some(s) = current.take() {
-                    s.stop();
+                if let Ok(mut g) = control.current.lock() {
+                    if let Some(s) = g.take() {
+                        s.stop();
+                    }
                 }
                 match try_play(&handle, bytes) {
                     Ok(sink) => {
-                        current = Some(sink);
+                        if let Ok(mut g) = control.current.lock() {
+                            *g = Some(sink);
+                        }
                         let _ = ack.send(Ok(()));
                     }
                     Err(e) => {
@@ -267,8 +328,31 @@ fn audio_thread(rx: std::sync::mpsc::Receiver<AudioCommand>) {
                 }
             }
             AudioCommand::Stop => {
-                if let Some(s) = current.take() {
-                    s.stop();
+                if let Ok(mut g) = control.current.lock() {
+                    if let Some(s) = g.take() {
+                        s.stop();
+                    }
+                }
+            }
+            AudioCommand::Pause => {
+                if let Ok(g) = control.current.lock() {
+                    if let Some(s) = g.as_ref() {
+                        s.pause();
+                    }
+                }
+            }
+            AudioCommand::Resume => {
+                if let Ok(g) = control.current.lock() {
+                    if let Some(s) = g.as_ref() {
+                        s.play();
+                    }
+                }
+            }
+            AudioCommand::SetSpeed(v) => {
+                if let Ok(g) = control.current.lock() {
+                    if let Some(s) = g.as_ref() {
+                        s.set_speed(v.clamp(0.25, 4.0));
+                    }
                 }
             }
             AudioCommand::PlaySound { bytes } => {

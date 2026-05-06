@@ -42,12 +42,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.view {
         View::Conversation => {
             let items = app.visible_items();
+            let playback = app.voice_playing.as_ref().map(|p| {
+                crate::message::PlaybackHint {
+                    msg_idx: p.msg_idx,
+                    reply_idx: p.reply_idx,
+                    pos_secs: p.pos_secs,
+                    speed: p.speed,
+                    paused: p.paused,
+                }
+            });
             let wrapped = wrap_view(
                 &app.messages,
                 &items,
                 &app.expanded_threads,
                 main.width,
                 main.height as usize,
+                playback.as_ref(),
             );
             let q = search_query_owned(app);
             let pos = widgets::render_wrapped_list(

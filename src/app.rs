@@ -238,6 +238,20 @@ pub struct App {
     /// Event id of the thread root the next outgoing message attaches to
     /// (`m.thread`). Takes precedence over a bare reply.
     pub thread_root: Option<String>,
+    /// Voice note that is currently being played (or paused). Refreshed
+    /// each tick from the audio thread.
+    pub voice_playing: Option<VoicePlayback>,
+}
+
+/// Tracks which message is being played, the message's full duration, and
+/// the latest playback snapshot so the conversation view can render an
+/// updated `[voix ...]` line.
+pub struct VoicePlayback {
+    pub msg_idx: usize,
+    pub reply_idx: Option<usize>,
+    pub pos_secs: f32,
+    pub speed: f32,
+    pub paused: bool,
 }
 
 impl App {
@@ -277,6 +291,7 @@ impl App {
             pending_reopen_active: 0,
             reply_to: None,
             thread_root: None,
+            voice_playing: None,
         };
         if s.settings_state.reopen_windows && !s.settings_state.last_windows.is_empty() {
             s.pending_reopen = s.settings_state.last_windows.clone();
@@ -824,6 +839,14 @@ impl App {
                 if let Some(b) = self.matrix.as_ref() {
                     b.send(MxCommand::PlayVoice { room_id, event_id });
                     self.flash = Some("téléchargement de la note vocale…".into());
+                    self.voice_playing = Some(VoicePlayback {
+                        msg_idx: item.msg_idx,
+                        reply_idx: matches!(item.kind, ItemKind::Reply)
+                            .then_some(item.reply_idx),
+                        pos_secs: 0.0,
+                        speed: 1.0,
+                        paused: false,
+                    });
                 }
             }
             _ => {
@@ -835,8 +858,80 @@ impl App {
     pub fn stop_voice(&mut self) {
         if let Some(b) = self.matrix.as_ref() {
             b.send(MxCommand::StopVoice);
+        }
+        if self.voice_playing.is_some() {
+            self.voice_playing = None;
             self.flash = Some("lecture arrêtée".into());
         }
+    }
+
+    /// Toggle pause/resume on the active voice playback. No-op if nothing
+    /// is currently loaded into the audio thread's sink.
+    pub fn toggle_voice_pause(&mut self) {
+        let p = match &mut self.voice_playing {
+            Some(p) => p,
+            None => return,
+        };
+        let b = match &self.matrix {
+            Some(b) => b,
+            None => return,
+        };
+        if p.paused {
+            b.voice_resume();
+            p.paused = false;
+            self.flash = Some("lecture reprise".into());
+        } else {
+            b.voice_pause();
+            p.paused = true;
+            self.flash = Some("lecture en pause".into());
+        }
+    }
+
+    /// Bump the active voice playback speed up (`)` key) or down (`(` key)
+    /// by `step`. Clamped to `[0.5, 2.0]` so we stay in usable territory.
+    pub fn voice_adjust_speed(&mut self, step: f32) {
+        let p = match &mut self.voice_playing {
+            Some(p) => p,
+            None => return,
+        };
+        let new_speed = (p.speed + step).clamp(0.5, 2.0);
+        if (new_speed - p.speed).abs() < f32::EPSILON {
+            return;
+        }
+        p.speed = new_speed;
+        if let Some(b) = &self.matrix {
+            b.voice_set_speed(new_speed);
+        }
+        self.flash = Some(format!("vitesse {:.2}x", new_speed));
+    }
+
+    /// Sample the audio thread's sink and copy position / speed / paused
+    /// state into `voice_playing` so the conversation view can render the
+    /// current message's playback line. Cleared once the sink reports
+    /// `finished`.
+    pub fn refresh_voice_state(&mut self) {
+        let p = match &mut self.voice_playing {
+            Some(p) => p,
+            None => return,
+        };
+        let b = match &self.matrix {
+            Some(b) => b,
+            None => return,
+        };
+        let status = match b.voice_status() {
+            Some(s) => s,
+            None => {
+                self.voice_playing = None;
+                return;
+            }
+        };
+        if status.finished {
+            self.voice_playing = None;
+            return;
+        }
+        p.pos_secs = status.pos_secs;
+        p.speed = status.speed;
+        p.paused = status.paused;
     }
 
     /// Send a notification sound to the audio thread, gated on the user's
@@ -1856,6 +1951,10 @@ impl App {
     /// Fetches and applies pending Matrix updates. Called on each
     /// UI loop iteration.
     pub fn apply_matrix_updates(&mut self) {
+        // Sample voice playback before draining; the run loop calls this
+        // each iteration so the voice "[lecture M:SS]" line stays in sync
+        // with the audio thread without needing a dedicated tick channel.
+        self.refresh_voice_state();
         let updates = match self.matrix.as_mut() {
             Some(b) => b.drain_updates(),
             None => return,
