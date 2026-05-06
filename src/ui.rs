@@ -9,13 +9,18 @@ use ratatui::{
     Frame,
 };
 
+/// Maximum number of lines the chat input bar can grow to before it
+/// scrolls vertically inside its own area.
+const INPUT_MAX_LINES: u16 = 5;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let input_height = input_visible_height(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(input_height),
         ])
         .split(frame.area());
 
@@ -146,46 +151,113 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let prefix = app.input_mode.prefix();
-    let prefix_cells = prefix.chars().count() + 1; // prefix + separator space
-    // Reserve one cell at the end for the cursor itself, so the cursor
-    // sits AFTER the last typed character instead of overlapping it.
-    let avail = (area.width as usize)
-        .saturating_sub(prefix_cells)
-        .saturating_sub(1);
-    let scroll = input_scroll_chars(app, avail);
-    let visible: String = app.input.chars().skip(scroll).take(avail).collect();
-    let line = format!("{} {}", prefix, visible);
     let style = if app.focus == Focus::Input {
         Style::default()
     } else {
         Style::default().add_modifier(Modifier::DIM)
     };
-    frame.render_widget(Paragraph::new(line).style(style), area);
+
+    let lines: Vec<&str> = app.input.split('\n').collect();
+    let (cursor_line, cursor_col) = cursor_line_col(&app.input, app.input_cursor);
+    let height = area.height as usize;
+    let v_scroll = vertical_scroll(cursor_line, height, lines.len());
+
+    for row in 0..height {
+        let line_idx = v_scroll + row;
+        let line_text = lines.get(line_idx).copied().unwrap_or("");
+        let prefix_str = if line_idx == 0 {
+            format!("{} ", prefix)
+        } else {
+            "  ".to_string()
+        };
+        let prefix_cells = prefix_str.chars().count();
+        // Reserve one cell at the end for the cursor itself.
+        let avail = (area.width as usize)
+            .saturating_sub(prefix_cells)
+            .saturating_sub(1);
+        let h_scroll = if line_idx == cursor_line {
+            horizontal_scroll(cursor_col, avail)
+        } else {
+            0
+        };
+        let visible: String = line_text.chars().skip(h_scroll).take(avail).collect();
+        let row_area = Rect {
+            x: area.x,
+            y: area.y + row as u16,
+            width: area.width,
+            height: 1,
+        };
+        let display = format!("{}{}", prefix_str, visible);
+        frame.render_widget(Paragraph::new(display).style(style), row_area);
+    }
 }
 
 fn place_input_cursor(frame: &mut Frame, area: Rect, app: &App) {
-    let prefix_cells = app.input_mode.prefix().chars().count() as u16 + 1;
+    let lines: Vec<&str> = app.input.split('\n').collect();
+    let (cursor_line, cursor_col) = cursor_line_col(&app.input, app.input_cursor);
+    let height = area.height as usize;
+    let v_scroll = vertical_scroll(cursor_line, height, lines.len());
+    let row_in_view = cursor_line.saturating_sub(v_scroll);
+    let prefix_cells = if cursor_line == 0 {
+        app.input_mode.prefix().chars().count() + 1
+    } else {
+        2
+    };
     let avail = (area.width as usize)
-        .saturating_sub(prefix_cells as usize)
+        .saturating_sub(prefix_cells)
         .saturating_sub(1);
-    let scroll = input_scroll_chars(app, avail);
-    let cursor_offset = app.input_cursor.saturating_sub(scroll) as u16;
-    let x = area.x + prefix_cells + cursor_offset;
+    let h_scroll = horizontal_scroll(cursor_col, avail);
+    let visible_col = cursor_col.saturating_sub(h_scroll);
+    let x = area.x + prefix_cells as u16 + visible_col as u16;
+    let y = area.y + row_in_view.min(height.saturating_sub(1)) as u16;
     let max_x = area.right().saturating_sub(1);
-    frame.set_cursor_position((x.min(max_x), area.y));
+    frame.set_cursor_position((x.min(max_x), y));
 }
 
-/// Compute how many leading characters of `app.input` should be scrolled
-/// off the visible window so that the editing cursor stays inside it.
-/// Window size is `avail` cells.
-fn input_scroll_chars(app: &App, avail: usize) -> usize {
-    if avail == 0 {
-        return app.input_cursor;
+fn input_visible_height(app: &App) -> u16 {
+    let n = app.input.split('\n').count() as u16;
+    n.max(1).min(INPUT_MAX_LINES)
+}
+
+fn cursor_line_col(input: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, c) in input.chars().enumerate() {
+        if i == cursor {
+            return (line, col);
+        }
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
     }
-    if app.input_cursor < avail {
+    (line, col)
+}
+
+fn horizontal_scroll(cursor_col: usize, avail: usize) -> usize {
+    if avail == 0 {
+        return cursor_col;
+    }
+    if cursor_col < avail {
         0
     } else {
-        app.input_cursor - avail
+        cursor_col - avail
+    }
+}
+
+fn vertical_scroll(cursor_line: usize, height: usize, total: usize) -> usize {
+    if height == 0 {
+        return cursor_line;
+    }
+    if total <= height {
+        return 0;
+    }
+    if cursor_line < height {
+        0
+    } else {
+        cursor_line + 1 - height
     }
 }
 

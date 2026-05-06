@@ -359,11 +359,16 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('a') if ctrl => app.input_home(),
         KeyCode::Char('e') if ctrl => app.input_end(),
         KeyCode::Char('k') if ctrl => app.input_kill_to_end(),
+        KeyCode::Char('s') if ctrl => app.submit_input(),
         KeyCode::Delete => app.input_delete_forward(),
         KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
         KeyCode::Backspace => app.input_backspace(),
         KeyCode::Enter => {
-            app.submit_input();
+            if app.settings_state.multi_line_input {
+                app.input_insert_char('\n');
+            } else {
+                app.submit_input();
+            }
         }
         _ => {}
     }
@@ -421,6 +426,7 @@ fn toggle_settings_field(s: &mut SettingsState) {
         settings_view::F_VOICE => s.voice_toggle = !s.voice_toggle,
         settings_view::F_KEYCHAIN => s.keychain_recovery = !s.keychain_recovery,
         settings_view::F_SOUNDS => s.sounds = !s.sounds,
+        settings_view::F_MULTILINE => s.multi_line_input = !s.multi_line_input,
         _ => {}
     }
 }

@@ -6,7 +6,7 @@ use ratatui::{
 };
 use widgets::{render_form, FormField};
 
-pub const FIELD_COUNT: usize = 11;
+pub const FIELD_COUNT: usize = 12;
 
 pub const F_TTS: usize = 0;
 pub const F_NATO: usize = 1;
@@ -16,9 +16,10 @@ pub const F_EDITOR: usize = 4;
 pub const F_KEYCHAIN: usize = 5;
 pub const F_PM_CMD: usize = 6;
 pub const F_SOUNDS: usize = 7;
-pub const F_DOC: usize = 8;
-pub const F_SAVE: usize = 9;
-pub const F_CANCEL: usize = 10;
+pub const F_MULTILINE: usize = 8;
+pub const F_DOC: usize = 9;
+pub const F_SAVE: usize = 10;
+pub const F_CANCEL: usize = 11;
 
 const SAS_OPTIONS: &[&str] = &["Décimal", "Emoji (noms)"];
 const VOICE_OPTIONS: &[&str] = &[
@@ -46,6 +47,9 @@ pub struct SettingsState {
     /// call ringing, errors). Borrows the OGG/Vorbis assets from
     /// element-web's `apps/web/res/media/`.
     pub sounds: bool,
+    /// When on, Entrée insère un saut de ligne dans la barre de saisie
+    /// et Ctrl+S envoie. Sinon, Entrée envoie directement.
+    pub multi_line_input: bool,
     pub focus_idx: usize,
 }
 
@@ -60,6 +64,7 @@ impl SettingsState {
             keychain_recovery: true,
             pm_cmd: String::new(),
             sounds: true,
+            multi_line_input: false,
             focus_idx: 0,
         }
     }
@@ -126,6 +131,10 @@ pub fn render(frame: &mut Frame, area: Rect, s: &SettingsState) -> (u16, u16) {
         FormField::Checkbox {
             label: "Sons d'événements (message / mention / appel)",
             checked: s.sounds,
+        },
+        FormField::Checkbox {
+            label: "Saisie multi-ligne (Entrée = saut de ligne, Ctrl+S = envoyer)",
+            checked: s.multi_line_input,
         },
         FormField::Spacer,
         FormField::Link {
