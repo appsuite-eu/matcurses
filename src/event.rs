@@ -340,6 +340,11 @@ fn handle_members_key(app: &mut App, key: KeyEvent) -> EventOutcome {
 
 fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Drop the in-flight completion as soon as the user does anything
+    // other than cycling through it.
+    if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        app.pending_completion = None;
+    }
     match key.code {
         KeyCode::Esc => app.set_focus(Focus::Conversation),
         // F-keys for view switches still work while typing.
@@ -375,6 +380,8 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::End if ctrl => app.input_end(),
         KeyCode::Char('k') if ctrl => app.input_kill_to_end(),
         KeyCode::Char('s') if ctrl => app.submit_input(),
+        KeyCode::Tab => app.input_tab_complete(true),
+        KeyCode::BackTab => app.input_tab_complete(false),
         KeyCode::Delete => app.input_delete_forward(),
         KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
         KeyCode::Backspace => app.input_backspace(),

@@ -99,6 +99,47 @@ const REACTION_OPTIONS: &[&str] = &[
     "+1", "-1", "heart", "smile", "laugh", "thinking", "eyes", "fire",
 ];
 
+/// Names accepted by `App::run_command`. Used by `Tab` autocomplete in
+/// the chat input bar.
+const SLASH_COMMANDS: &[&str] = &[
+    "quit",
+    "q",
+    "help",
+    "h",
+    "version",
+    "me",
+    "join",
+    "j",
+    "leave",
+    "part",
+    "redact",
+    "del",
+    "react",
+    "restore",
+    "recovery",
+    "setup",
+    "enable-recovery",
+    "verify",
+    "logout",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    Slash,
+    Mention,
+}
+
+pub struct CompletionState {
+    #[allow(dead_code)]
+    pub kind: CompletionKind,
+    /// Char position of the trigger char (`/` or `@`).
+    pub trigger: usize,
+    /// Replacement strings (without the trigger char).
+    pub candidates: Vec<String>,
+    /// Index of the currently inserted candidate inside `candidates`.
+    pub current: usize,
+}
+
 pub struct App {
     pub view: View,
     pub focus: Focus,
@@ -136,6 +177,9 @@ pub struct App {
     /// are waiting to confirm worked. On `Update::RecoverySuccess`, if
     /// the keychain flag is on and no entry exists yet, we persist it.
     pub pending_recovery_key: Option<String>,
+    /// In-flight Tab completion (slash command or `@user` mention).
+    /// Reset to None on any key event other than Tab/BackTab.
+    pub pending_completion: Option<CompletionState>,
 }
 
 impl App {
@@ -168,6 +212,7 @@ impl App {
             current_room_id: None,
             matrix_logged_in: false,
             pending_recovery_key: None,
+            pending_completion: None,
         };
         // Try to restore a previously-persisted session on startup, so the
         // user doesn't have to log in again every time.
@@ -866,6 +911,115 @@ impl App {
     pub fn input_clear(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.pending_completion = None;
+    }
+
+    /// Tab completion entry point. If a completion is already in flight,
+    /// advance to the next candidate (cycle). Otherwise, detect whether
+    /// the cursor is in a slash-command or `@user` mention context, build
+    /// the candidate list, and apply the first match.
+    pub fn input_tab_complete(&mut self, forward: bool) {
+        if let Some(state) = &self.pending_completion {
+            if state.candidates.is_empty() {
+                return;
+            }
+            let n = state.candidates.len();
+            let next = if forward {
+                (state.current + 1) % n
+            } else {
+                (state.current + n - 1) % n
+            };
+            self.apply_completion(next);
+            return;
+        }
+
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+
+        // Walk back from the cursor to find a trigger ('@' or '/'). Stop on
+        // whitespace or newline — the trigger has to be in the same word.
+        let mut trigger_pos: Option<usize> = None;
+        let mut kind: Option<CompletionKind> = None;
+        let mut i = cursor;
+        while i > 0 {
+            let c = chars[i - 1];
+            if c == '\n' || c.is_whitespace() {
+                break;
+            }
+            i -= 1;
+            match chars[i] {
+                '@' => {
+                    trigger_pos = Some(i);
+                    kind = Some(CompletionKind::Mention);
+                    break;
+                }
+                '/' => {
+                    // A slash command must sit at the very start of a line.
+                    if i == 0 || chars[i - 1] == '\n' {
+                        trigger_pos = Some(i);
+                        kind = Some(CompletionKind::Slash);
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let trigger = match trigger_pos {
+            Some(p) => p,
+            None => return,
+        };
+        let kind = kind.unwrap();
+        let prefix: String = chars[trigger + 1..cursor].iter().collect();
+
+        let candidates = match kind {
+            CompletionKind::Slash => slash_candidates(&prefix),
+            CompletionKind::Mention => self.mention_candidates(&prefix),
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        self.pending_completion = Some(CompletionState {
+            kind,
+            trigger,
+            candidates,
+            current: 0,
+        });
+        self.apply_completion(0);
+    }
+
+    fn apply_completion(&mut self, idx: usize) {
+        let (trigger, candidate) = {
+            let state = match self.pending_completion.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            if idx >= state.candidates.len() {
+                return;
+            }
+            state.current = idx;
+            (state.trigger, state.candidates[idx].clone())
+        };
+        let start = self.byte_index_for_char(trigger + 1);
+        let end = self.byte_index_for_char(self.input_cursor);
+        self.input.replace_range(start..end, &candidate);
+        self.input_cursor = trigger + 1 + candidate.chars().count();
+    }
+
+    fn mention_candidates(&self, prefix: &str) -> Vec<String> {
+        let lower = prefix.to_lowercase();
+        let mut out = Vec::new();
+        for m in &self.members_state.members {
+            let dn = m.displayname.to_lowercase();
+            let mxid_lower = m.mxid.to_lowercase();
+            if dn.starts_with(&lower) || mxid_lower.contains(&lower) {
+                // Insert the full MXID (without leading '@', since the
+                // trigger is already in the buffer). The full MXID is
+                // what triggers a notification on the recipient side.
+                out.push(m.mxid.trim_start_matches('@').to_string());
+            }
+        }
+        out
     }
 
     pub fn input_set(&mut self, content: String) {
@@ -1942,6 +2096,15 @@ fn suspend_for_editor(
 
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+fn slash_candidates(prefix: &str) -> Vec<String> {
+    let lower = prefix.to_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.to_lowercase().starts_with(&lower))
+        .map(|c| (*c).to_string())
+        .collect()
 }
 
 /// Walk `s` and return the (line, column) char-coordinates of the
