@@ -326,8 +326,9 @@ async fn matrix_main(
 
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
+                        let pending = pending_sas.clone();
                         tokio::spawn(async move {
-                            run_sync(arc2, tx).await;
+                            run_sync(arc2, tx, pending).await;
                         });
                     }
                     Err(e) => {
@@ -348,8 +349,9 @@ async fn matrix_main(
 
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
+                        let pending = pending_sas.clone();
                         tokio::spawn(async move {
-                            run_sync(arc2, tx).await;
+                            run_sync(arc2, tx, pending).await;
                         });
                     }
                     Ok(None) => {
@@ -1119,8 +1121,14 @@ fn session_store_path(mxid: &str) -> std::io::Result<PathBuf> {
 }
 
 /// Run the continuous sync and push Rooms updates on every tick.
-async fn run_sync(client: Arc<Client>, tx: Sender<Update>) {
-    // Handler pour live messages.
+async fn run_sync(
+    client: Arc<Client>,
+    tx: Sender<Update>,
+    pending_sas: std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<SasUserDecision>>>,
+    >,
+) {
+    // Live messages.
     let tx_handler = tx.clone();
     client.add_event_handler(
         move |ev: SyncRoomMessageEvent, room: matrix_sdk::room::Room| {
@@ -1142,6 +1150,53 @@ async fn run_sync(client: Arc<Client>, tx: Sender<Update>) {
                         message: msg,
                     })
                     .await;
+            }
+        },
+    );
+
+    // Incoming verification requests (other devices initiating SAS toward us).
+    // We auto-accept and run the same flow as outgoing, opening the SAS modal.
+    let tx_v = tx.clone();
+    let pending_v = pending_sas.clone();
+    client.add_event_handler(
+        move |ev: matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
+              c: matrix_sdk::Client| {
+            let tx = tx_v.clone();
+            let pending = pending_v.clone();
+            async move {
+                let request = match c
+                    .encryption()
+                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
+                    .await
+                {
+                    Some(r) => r,
+                    None => return,
+                };
+                let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+                *pending.lock().await = Some(decision_tx);
+                let _ = tx
+                    .send(Update::Error {
+                        reason: format!(
+                            "vérification entrante de {} — accepte sur l'autre device",
+                            ev.sender
+                        ),
+                    })
+                    .await;
+                let result = run_sas_incoming(request, &tx, decision_rx).await;
+                let _ = pending.lock().await.take();
+                match result {
+                    Ok(ok) => {
+                        let _ = tx.send(Update::SasDone { ok }).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Update::Error {
+                                reason: format!("verify entrant : {e}"),
+                            })
+                            .await;
+                        let _ = tx.send(Update::SasDone { ok: false }).await;
+                    }
+                }
             }
         },
     );
@@ -1439,28 +1494,13 @@ async fn recover_from_key(
     Ok(())
 }
 
-/// Drive a full SAS verification flow against `user_id`.
-///
-/// Steps:
-/// 1. Request verification on the user's identity.
-/// 2. Wait for the request to be ready (the other end accepted).
-/// 3. Start the short authentication string flow.
-/// 4. Wait for keys to be exchanged so we can present decimals + emoji.
-/// 5. Push `Update::SasReady` to the UI and await a `SasUserDecision`
-///    via the oneshot.
-/// 6. Apply the decision (`confirm`/`mismatch`/`cancel`) and wait for
-///    the verification to settle.
-///
-/// Returns `Ok(true)` if the verification finished as confirmed on
-/// both sides, `Ok(false)` for mismatch / cancellation.
+/// Outgoing SAS verification: initiate the request, then run the flow.
 async fn run_sas_verification(
     client: &Client,
     user_id: &str,
     tx: &Sender<Update>,
     decision_rx: tokio::sync::oneshot::Receiver<SasUserDecision>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    use futures_util::StreamExt;
-    use matrix_sdk::encryption::verification::SasState;
     use matrix_sdk::ruma::OwnedUserId;
 
     let parsed: OwnedUserId = user_id.parse()?;
@@ -1471,8 +1511,32 @@ async fn run_sas_verification(
         .ok_or("user identity not found (re-sync may help)")?;
 
     let request = identity.request_verification().await?;
+    drive_verification_flow(request, tx, decision_rx).await
+}
 
-    // Wait for the request to be ready (other side accepted the request).
+/// Incoming SAS verification: another device requested verification.
+/// We accept the request and run the flow from there.
+async fn run_sas_incoming(
+    request: matrix_sdk::encryption::verification::VerificationRequest,
+    tx: &Sender<Update>,
+    decision_rx: tokio::sync::oneshot::Receiver<SasUserDecision>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    request.accept().await?;
+    drive_verification_flow(request, tx, decision_rx).await
+}
+
+/// Shared verification driver: wait for ready, start SAS, present, apply
+/// the user decision, wait for completion. Used by both the outgoing
+/// (`/verify`) and incoming (peer-initiated) paths.
+async fn drive_verification_flow(
+    request: matrix_sdk::encryption::verification::VerificationRequest,
+    tx: &Sender<Update>,
+    decision_rx: tokio::sync::oneshot::Receiver<SasUserDecision>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    use futures_util::StreamExt;
+    use matrix_sdk::encryption::verification::SasState;
+
+    // Wait for the request to be ready (both ends agreed on methods).
     {
         let mut changes = request.changes();
         loop {
@@ -1488,13 +1552,11 @@ async fn run_sas_verification(
         }
     }
 
-    // Start the SAS sub-protocol.
     let sas = request
         .start_sas()
         .await?
         .ok_or("SAS not negotiable for this peer")?;
 
-    // Wait for the SAS to be presentable (keys exchanged).
     {
         let mut changes = sas.changes();
         loop {
@@ -1510,9 +1572,7 @@ async fn run_sas_verification(
         }
     }
 
-    let decimal = sas
-        .decimals()
-        .ok_or("SAS produced no decimals")?;
+    let decimal = sas.decimals().ok_or("SAS produced no decimals")?;
     let emoji_strings: Vec<(String, String)> = sas
         .emoji()
         .map(|emoji| {
@@ -1540,7 +1600,6 @@ async fn run_sas_verification(
         SasUserDecision::Cancel => sas.cancel().await?,
     }
 
-    // Wait for the SAS to settle.
     let mut changes = sas.changes();
     while !sas.is_done() && !sas.is_cancelled() {
         if changes.next().await.is_none() {
@@ -1554,6 +1613,30 @@ async fn run_sas_verification(
 async fn enable_recovery(
     client: &Client,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Check the recovery state first so we can give a useful error instead
+    // of the SDK's opaque "Secret storage already exists" failure.
+    use matrix_sdk::encryption::recovery::RecoveryState;
+    match client.encryption().recovery().state() {
+        RecoveryState::Disabled => {}
+        RecoveryState::Enabled => {
+            return Err(
+                "E2EE déjà configuré sur ce compte. Utilise /restore avec ta clé existante \
+                 (depuis Element ou un autre client). Pour générer une nouvelle clé, il faut \
+                 d'abord la désactiver depuis un client qui la connaît."
+                    .into(),
+            );
+        }
+        RecoveryState::Incomplete => {
+            // Partial state: the SDK's `enable()` should be able to finish the
+            // setup. Proceed.
+        }
+        RecoveryState::Unknown => {
+            return Err(
+                "État E2EE pas encore connu — attends la fin de la synchro initiale et réessaie."
+                    .into(),
+            );
+        }
+    }
     // `enable()` provisions cross-signing keys + a server-side key backup
     // (Megolm session keys), generating a fresh recovery key string that
     // the user MUST save: there is no way to retrieve it later.
