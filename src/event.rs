@@ -10,6 +10,9 @@ pub enum EventOutcome {
     /// Suspend the TUI and open the given content in `$EDITOR` for
     /// leisurely reading. Resumes the TUI when the editor exits.
     OpenEditor(String),
+    /// Suspend the TUI and open the given content in `$EDITOR` for
+    /// editing. The edited content replaces `app.input` on return.
+    EditInput(String),
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> EventOutcome {
@@ -336,9 +339,19 @@ fn handle_members_key(app: &mut App, key: KeyEvent) -> EventOutcome {
 }
 
 fn handle_input_key(app: &mut App, key: KeyEvent) -> EventOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => app.set_focus(Focus::Conversation),
-        KeyCode::Char(c) => app.input.push(c),
+        // F-keys for view switches still work while typing.
+        KeyCode::F(3) => app.open_spaces(),
+        KeyCode::F(4) => app.open_rooms(),
+        KeyCode::F(5) => app.open_members(),
+        KeyCode::Up => app.set_focus(Focus::Conversation),
+        // Ctrl+G — pop $EDITOR with the current input as initial content.
+        KeyCode::Char('g') if ctrl => {
+            return EventOutcome::EditInput(app.input.clone());
+        }
+        KeyCode::Char(c) if !ctrl => app.input.push(c),
         KeyCode::Backspace => {
             app.input.pop();
         }
@@ -400,6 +413,7 @@ fn toggle_settings_field(s: &mut SettingsState) {
         settings_view::F_SAS => s.sas_decimal = !s.sas_decimal,
         settings_view::F_VOICE => s.voice_toggle = !s.voice_toggle,
         settings_view::F_KEYCHAIN => s.keychain_recovery = !s.keychain_recovery,
+        settings_view::F_SOUNDS => s.sounds = !s.sounds,
         _ => {}
     }
 }

@@ -146,7 +146,15 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let prefix = app.input_mode.prefix();
-    let line = format!("{} {}", prefix, app.input);
+    let prefix_cells = prefix.chars().count() + 1; // prefix + separator space
+    let avail = (area.width as usize).saturating_sub(prefix_cells);
+    let total = app.input.chars().count();
+    // Horizontal scroll: when the typed input is longer than the visible
+    // area, show its tail so the cursor stays on the last character. Skip
+    // is in chars (not bytes) to handle UTF-8 cleanly.
+    let skip = total.saturating_sub(avail);
+    let visible: String = app.input.chars().skip(skip).collect();
+    let line = format!("{} {}", prefix, visible);
     let style = if app.focus == Focus::Input {
         Style::default()
     } else {
@@ -157,10 +165,12 @@ fn draw_input_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn place_input_cursor(frame: &mut Frame, area: Rect, app: &App) {
     let prefix_cells = app.input_mode.prefix().chars().count() as u16 + 1;
-    let typed_cells = app.input.chars().count() as u16;
+    let avail = area.width.saturating_sub(prefix_cells);
+    let total = app.input.chars().count() as u16;
+    let visible_len = total.min(avail);
+    let x = area.x + prefix_cells + visible_len;
     let max_x = area.right().saturating_sub(1);
-    let x = (area.x + prefix_cells + typed_cells).min(max_x);
-    frame.set_cursor_position((x, area.y));
+    frame.set_cursor_position((x.min(max_x), area.y));
 }
 
 fn search_query_owned(app: &App) -> Option<String> {

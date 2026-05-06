@@ -190,6 +190,21 @@ impl App {
                                 self.flash = Some(format!("éditeur : {e}"));
                             }
                         }
+                        EventOutcome::EditInput(content) => {
+                            let editor = self.settings_state.editor.clone();
+                            match suspend_for_input_editor(terminal, &content, &editor) {
+                                Ok(Some(new_content)) => {
+                                    self.input = new_content;
+                                    self.flash = Some(
+                                        "saisie chargée · Entrée envoie".into(),
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    self.flash = Some(format!("éditeur : {e}"));
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -317,6 +332,19 @@ impl App {
             title: "Quitter".into(),
             message: "Quitter matcurses ?".into(),
             action: ConfirmAction::Quit,
+            focused: ConfirmButton::No,
+        }));
+    }
+
+    pub fn open_logout_confirm(&mut self) {
+        if !self.matrix_logged_in {
+            self.flash = Some("pas connecté".into());
+            return;
+        }
+        self.modal = Some(Modal::Confirm(ConfirmModal {
+            title: "Déconnexion".into(),
+            message: format!("Te déconnecter de {} ?", self.me),
+            action: ConfirmAction::Logout,
             focused: ConfirmButton::No,
         }));
     }
@@ -559,6 +587,17 @@ impl App {
         if let Some(b) = self.matrix.as_ref() {
             b.send(MxCommand::StopVoice);
             self.flash = Some("lecture arrêtée".into());
+        }
+    }
+
+    /// Send a notification sound to the audio thread, gated on the user's
+    /// settings checkbox.
+    pub fn play_event_sound(&self, kind: crate::sounds::SoundKind) {
+        if !self.settings_state.sounds {
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::PlaySound { kind });
         }
     }
 
@@ -806,6 +845,7 @@ impl App {
             "redact" | "del" => self.open_redact_confirm(),
             "restore" | "recovery" => self.open_recovery_input(),
             "setup" | "enable-recovery" => self.enable_recovery(),
+            "logout" => self.open_logout_confirm(),
             "verify" => {
                 let target = if args.is_empty() { None } else { Some(args) };
                 self.verify_user(target);
@@ -984,6 +1024,7 @@ impl App {
             "/setup                 générer la clé E2EE (1re fois sur ce compte)".into(),
             "/restore, /recovery    importer une clé de récupération E2EE".into(),
             "/verify [@user:srv]    vérification SAS (défaut : soi-même)".into(),
+            "/logout                déconnexion + wipe local".into(),
             String::new(),
             "Échapper un slash : commencer le message par //".into(),
         ];
@@ -1008,6 +1049,27 @@ impl App {
 
     fn apply_one_update(&mut self, u: MxUpdate) {
         match u {
+            MxUpdate::LoggedOut => {
+                self.matrix_logged_in = false;
+                self.me.clear();
+                self.current_room.clear();
+                self.current_room_id = None;
+                self.messages.clear();
+                self.expanded_threads.clear();
+                self.selected = 0;
+                self.scroll_top = 0;
+                self.room_list_state.rooms.clear();
+                self.room_list_state.set_selected(0);
+                self.members_state.members.clear();
+                self.members_state.set_selected(0);
+                self.space_tree_state.roots.clear();
+                self.space_tree_state.set_selected(0);
+                self.room_ids.clear();
+                self.pending_recovery_key = None;
+                self.modal = None;
+                self.flash = Some("déconnecté · Ctrl+L pour retenter".into());
+                self.update_status();
+            }
             MxUpdate::LoggedIn { mxid } => {
                 self.matrix_logged_in = true;
                 self.me = mxid.clone();
@@ -1070,6 +1132,7 @@ impl App {
             }
             MxUpdate::NewMessage { room_id, message } => {
                 if self.current_room_id.as_deref() == Some(&room_id) {
+                    let mentioned = is_mention(&message, &self.me);
                     let was_at_bottom = {
                         let v = self.visible_items();
                         v.is_empty() || self.selected + 1 >= v.len()
@@ -1079,6 +1142,11 @@ impl App {
                         let v = self.visible_items();
                         self.selected = v.len().saturating_sub(1);
                     }
+                    self.play_event_sound(if mentioned {
+                        crate::sounds::SoundKind::Mention
+                    } else {
+                        crate::sounds::SoundKind::Message
+                    });
                     self.update_status();
                 }
             }
@@ -1488,6 +1556,12 @@ impl App {
         self.modal = None;
         match action {
             ConfirmAction::Quit => self.should_quit = true,
+            ConfirmAction::Logout => {
+                if let Some(b) = self.matrix.as_ref() {
+                    b.send(MxCommand::Logout);
+                    self.flash = Some("déconnexion en cours…".into());
+                }
+            }
             ConfirmAction::Redact(idx) => {
                 if idx < self.messages.len() {
                     self.messages.remove(idx);
@@ -1669,6 +1743,52 @@ fn expand_by_labels(
     }
 }
 
+/// Like `suspend_for_editor` but returns the post-edit content so the
+/// caller can replace e.g. `app.input` with what the user wrote in the
+/// editor. Returns `Ok(None)` if the file ends up empty.
+fn suspend_for_input_editor(
+    terminal: &mut DefaultTerminal,
+    content: &str,
+    editor: &str,
+) -> io::Result<Option<String>> {
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+
+    let path = std::env::temp_dir().join(format!("matcurses-input-{}.txt", std::process::id()));
+    std::fs::write(&path, content)?;
+
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+
+    let cmd = if !editor.trim().is_empty() {
+        editor.to_string()
+    } else {
+        std::env::var("EDITOR").unwrap_or_else(|_| "vi".into())
+    };
+    let _ = std::process::Command::new(&cmd).arg(&path).status();
+
+    enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    let result = std::fs::read_to_string(&path).ok().map(|s| {
+        // Trim a single trailing newline (vi adds one) but keep internal
+        // line breaks. The user explicitly went into the editor to type
+        // multi-line content.
+        let mut s = s;
+        if s.ends_with('\n') {
+            s.pop();
+            if s.ends_with('\r') {
+                s.pop();
+            }
+        }
+        s
+    });
+    let _ = std::fs::remove_file(&path);
+    Ok(result.filter(|s| !s.is_empty()))
+}
+
 /// Leave raw mode + the alternate screen, run the configured editor on a
 /// temp file containing `content`, then re-enter the TUI. Resolution
 /// order for the editor command: explicit `editor` argument (settings),
@@ -1701,6 +1821,38 @@ fn suspend_for_editor(
 
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// Heuristic detection of a mention of `me` in `message`. Matches the full
+/// MXID or the localpart against any text/code block. Good enough for the
+/// notification-sound gate; not authoritative for any security-bearing
+/// decision.
+fn is_mention(message: &Message, me: &str) -> bool {
+    if me.is_empty() {
+        return false;
+    }
+    let me_lower = me.to_lowercase();
+    let local = me
+        .trim_start_matches('@')
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    for b in &message.blocks {
+        let text = match b {
+            Block::Text(t) => t,
+            Block::Code(t) => t,
+            Block::Voice { .. } => continue,
+        };
+        let t = text.to_lowercase();
+        if t.contains(&me_lower) {
+            return true;
+        }
+        if !local.is_empty() && t.contains(&local) {
+            return true;
+        }
+    }
+    false
 }
 
 fn append_blocks_preview(lines: &mut Vec<String>, blocks: &[Block]) {

@@ -62,6 +62,10 @@ pub enum Command {
     PlayVoice { room_id: String, event_id: String },
     /// Stop the currently-playing voice note, if any.
     StopVoice,
+    /// Play a short event notification sound (new message, mention,
+    /// call ringing, …). Plays on a detached sink so it does not
+    /// preempt voice-note playback.
+    PlaySound { kind: crate::sounds::SoundKind },
     /// Send an `m.reaction` to a parent event in a room.
     SendReaction {
         room_id: String,
@@ -85,6 +89,11 @@ pub enum Command {
     /// secured by a freshly-generated recovery key. The key is returned
     /// via `Update::RecoveryKeyGenerated` for the user to save.
     EnableRecovery,
+    /// Log out from the homeserver, revoke the access token, wipe the
+    /// local session.json + last_mxid + SQLite store for this account,
+    /// and clear the client. After this the bridge is back to the
+    /// "no session" state.
+    Logout,
     /// Initiate a SAS verification request against `user_id`. Typically
     /// used to verify another device of the same user.
     VerifyUser { user_id: String },
@@ -100,6 +109,9 @@ pub enum Command {
 pub enum Update {
     /// Login OK: effective MXID (in case of autodiscovery).
     LoggedIn { mxid: String },
+    /// Logout completed (or attempted). The UI should clear all
+    /// session-bound state (rooms, messages, members, spaces…).
+    LoggedOut,
     /// Login failed: human-readable error message.
     LoginFailed { reason: String },
     /// Rooms list updated (sync or manual refresh).
@@ -163,6 +175,11 @@ enum AudioCommand {
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Stop,
+    /// Play a short event notification sound on a detached sink. Multiple
+    /// concurrent event sounds may stack; voice-note playback is unaffected.
+    PlaySound {
+        bytes: &'static [u8],
+    },
 }
 
 /// UI-side bridge. Owns the sender/receiver and the tokio runtime.
@@ -246,6 +263,18 @@ fn audio_thread(rx: std::sync::mpsc::Receiver<AudioCommand>) {
                     s.stop();
                 }
             }
+            AudioCommand::PlaySound { bytes } => {
+                let cursor = std::io::Cursor::new(bytes);
+                if let Ok(source) = rodio::Decoder::new(cursor) {
+                    if let Ok(sink) = rodio::Sink::try_new(&handle) {
+                        sink.append(source);
+                        // Detach: the sink keeps playing after we drop it,
+                        // so multiple event sounds can overlap without us
+                        // tracking lifetimes.
+                        sink.detach();
+                    }
+                }
+            }
         }
     }
 }
@@ -292,6 +321,12 @@ async fn matrix_main(
     use tokio::sync::Mutex as AsyncMutex;
     let pending_sas: Arc<AsyncMutex<Option<tokio::sync::oneshot::Sender<SasUserDecision>>>> =
         Arc::new(AsyncMutex::new(None));
+    // Tracks the currently open room so the sync callback can refetch its
+    // timeline whenever new events arrive — a safety net for cases where
+    // the SyncRoomMessageEvent live handler does not fire (e.g. delayed
+    // Megolm decryption on bridge-encrypted rooms).
+    let current_room: Arc<AsyncMutex<Option<OwnedRoomId>>> =
+        Arc::new(AsyncMutex::new(None));
     let mut client: Option<Arc<Client>> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
@@ -331,8 +366,9 @@ async fn matrix_main(
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
                         let pending = pending_sas.clone();
+                        let cur = current_room.clone();
                         tokio::spawn(async move {
-                            run_sync(arc2, tx, pending).await;
+                            run_sync(arc2, tx, pending, cur).await;
                         });
                     }
                     Err(e) => {
@@ -380,8 +416,9 @@ async fn matrix_main(
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
                         let pending = pending_sas.clone();
+                        let cur = current_room.clone();
                         tokio::spawn(async move {
-                            run_sync(arc2, tx, pending).await;
+                            run_sync(arc2, tx, pending, cur).await;
                         });
                     }
                     Err(e) => {
@@ -403,8 +440,9 @@ async fn matrix_main(
                         let tx = update_tx.clone();
                         let arc2 = arc.clone();
                         let pending = pending_sas.clone();
+                        let cur = current_room.clone();
                         tokio::spawn(async move {
-                            run_sync(arc2, tx, pending).await;
+                            run_sync(arc2, tx, pending, cur).await;
                         });
                     }
                     Ok(None) => {
@@ -421,6 +459,11 @@ async fn matrix_main(
                 }
             }
             Command::OpenRoom { room_id } => {
+                // Record the active room so the sync callback can refetch
+                // its timeline whenever new events arrive on it.
+                if let Ok(parsed) = room_id.parse::<OwnedRoomId>() {
+                    *current_room.lock().await = Some(parsed);
+                }
                 if let Some(c) = &client {
                     let tx = update_tx.clone();
                     let c = c.clone();
@@ -553,6 +596,11 @@ async fn matrix_main(
             Command::StopVoice => {
                 let _ = audio_tx.send(AudioCommand::Stop);
             }
+            Command::PlaySound { kind } => {
+                let _ = audio_tx.send(AudioCommand::PlaySound {
+                    bytes: crate::sounds::bytes_for(kind),
+                });
+            }
             Command::SendReaction {
                 room_id,
                 parent_event_id,
@@ -660,6 +708,28 @@ async fn matrix_main(
                 if let Some(s) = pending_sas.lock().await.take() {
                     let _ = s.send(SasUserDecision::Cancel);
                 }
+            }
+            Command::Logout => {
+                // Best-effort: try to revoke the token server-side, then wipe
+                // local persistence regardless of network success so we end
+                // up in a clean "logged out" state.
+                let mxid = client
+                    .as_ref()
+                    .and_then(|c| c.user_id().map(|u| u.to_string()))
+                    .unwrap_or_default();
+                if let Some(c) = &client {
+                    let _ = c.matrix_auth().logout().await;
+                }
+                if !mxid.is_empty() {
+                    if let Ok(p) = session_store_path(&mxid) {
+                        let _ = std::fs::remove_dir_all(&p);
+                    }
+                }
+                if let Ok(p) = last_mxid_file() {
+                    let _ = std::fs::remove_file(&p);
+                }
+                client = None;
+                let _ = update_tx.send(Update::LoggedOut).await;
             }
             Command::EnableRecovery => {
                 if let Some(c) = &client {
@@ -1244,6 +1314,7 @@ async fn run_sync(
     pending_sas: std::sync::Arc<
         tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<SasUserDecision>>>,
     >,
+    current_room: std::sync::Arc<tokio::sync::Mutex<Option<OwnedRoomId>>>,
 ) {
     // Live messages.
     let tx_handler = tx.clone();
@@ -1336,12 +1407,27 @@ async fn run_sync(
     // like mautrix-whatsapp), unread count changes, name changes, etc.
     let tx_cb = tx.clone();
     let client_cb = client.clone();
+    let cur_cb = current_room.clone();
     let result = client
-        .sync_with_callback(settings, move |_response| {
+        .sync_with_callback(settings, move |response| {
             let tx = tx_cb.clone();
             let c = client_cb.clone();
+            let cur = cur_cb.clone();
             async move {
                 let _ = tx.send(snapshot_rooms(&c).await).await;
+                // Safety net for the live SyncRoomMessageEvent handler:
+                // if the active room received any timeline events this
+                // iteration, force a refetch. Catches messages that the
+                // SDK could not yet decrypt at handler time, or that the
+                // bridge re-encrypted asynchronously.
+                let cur_id = cur.lock().await.clone();
+                if let Some(rid) = cur_id {
+                    if let Some(joined) = response.rooms.join.get(&rid) {
+                        if !joined.timeline.events.is_empty() {
+                            let _ = load_room_messages(&c, &rid.to_string(), &tx).await;
+                        }
+                    }
+                }
                 matrix_sdk::LoopCtrl::Continue
             }
         })

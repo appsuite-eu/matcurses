@@ -3,6 +3,7 @@ mod audio;
 mod event;
 mod matrix;
 mod secrets;
+mod sounds;
 mod message;
 mod modal;
 mod ui;

@@ -18,6 +18,7 @@ use widgets::{
 pub enum ConfirmAction {
     Quit,
     Redact(usize),
+    Logout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
