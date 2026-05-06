@@ -2087,6 +2087,17 @@ impl App {
                 self.flash = Some(format!("login KO : {}", reason));
             }
             MxUpdate::Rooms { rooms, ids } => {
+                // Defense: a transient empty snapshot (saw this when
+                // `client.rooms()` returned 0 mid-sync) would wipe the
+                // populated list and leave F4 / windows looking empty
+                // until the next iteration. Drop empty updates as long
+                // as we already had rooms — the next non-empty snapshot
+                // will overwrite cleanly.
+                if rooms.is_empty()
+                    && !self.room_list_state.rooms.is_empty()
+                {
+                    return;
+                }
                 // Preserve the selection if possible (by name).
                 let prev_name = self.room_list_state.selected_room_name();
                 self.room_list_state.rooms = rooms;
@@ -2298,6 +2309,13 @@ impl App {
                 }));
             }
             MxUpdate::Spaces { roots } => {
+                // Same defense as for `Rooms`: don't replace the tree with
+                // an empty result if we already had spaces. Happens when
+                // a hierarchy call fails or `client.rooms()` is briefly
+                // empty during the first sync window.
+                if roots.is_empty() && !self.space_tree_state.roots.is_empty() {
+                    return;
+                }
                 // Preserve user state across reloads: keep the currently
                 // selected path and re-expand any space that was open before.
                 let prev_path = self
