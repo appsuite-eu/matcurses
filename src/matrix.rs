@@ -172,6 +172,10 @@ pub enum Command {
     /// Upload the given local file as the local user's avatar and point
     /// the account at the resulting MXC URI.
     SetAvatar { path: String },
+    /// Send a file from disk as an attachment. The msgtype (m.image /
+    /// m.audio / m.video / m.file) is derived from the MIME type. In an
+    /// encrypted room the SDK encrypts the upload transparently.
+    SendAttachment { room_id: String, path: String },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -1044,6 +1048,33 @@ async fn matrix_main(
                                     reason: format!("/name : {e}"),
                                 })
                                 .await;
+                        }
+                    });
+                }
+            }
+            Command::SendAttachment { room_id, path } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match send_attachment(&c, &room_id, &path).await {
+                            Ok(name) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("envoyé : {name}"),
+                                    })
+                                    .await;
+                                // Refresh so the new event lands in the UI.
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                let _ = load_room_messages(&c, &room_id, &tx).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/upload : {e}"),
+                                    })
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -2760,9 +2791,9 @@ async fn upload_avatar(
     Ok(())
 }
 
-/// Minimal MIME sniffer based on the file extension. Avatars are
-/// typically PNG/JPEG/GIF/WebP; anything else gets rejected upstream by
-/// the homeserver.
+/// Minimal MIME sniffer based on the file extension. Covers the formats
+/// the homeserver / Element will treat as inline media; anything else
+/// falls back to `application/octet-stream` (sent as `m.file`).
 fn mime_from_ext(path: &str) -> &'static str {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".png") {
@@ -2773,9 +2804,67 @@ fn mime_from_ext(path: &str) -> &'static str {
         "image/gif"
     } else if lower.ends_with(".webp") {
         "image/webp"
+    } else if lower.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if lower.ends_with(".ogg") || lower.ends_with(".opus") {
+        "audio/ogg"
+    } else if lower.ends_with(".wav") {
+        "audio/wav"
+    } else if lower.ends_with(".flac") {
+        "audio/flac"
+    } else if lower.ends_with(".m4a") || lower.ends_with(".aac") {
+        "audio/mp4"
+    } else if lower.ends_with(".mp4") {
+        "video/mp4"
+    } else if lower.ends_with(".webm") {
+        "video/webm"
+    } else if lower.ends_with(".mov") {
+        "video/quicktime"
+    } else if lower.ends_with(".pdf") {
+        "application/pdf"
+    } else if lower.ends_with(".txt") || lower.ends_with(".log") {
+        "text/plain"
     } else {
         "application/octet-stream"
     }
+}
+
+/// Read a local file, infer its MIME type, and post it to the room. The
+/// SDK picks the right `m.file` / `m.image` / `m.audio` / `m.video`
+/// msgtype from the MIME prefix. Encrypted rooms encrypt the upload
+/// automatically when the `e2e-encryption` feature is enabled (we have
+/// it on, see Cargo.toml).
+async fn send_attachment(
+    client: &Client,
+    room_id: &str,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::attachment::AttachmentConfig;
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("room introuvable")?;
+
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    };
+    let bytes = std::fs::read(&expanded)
+        .map_err(|e| format!("lecture {expanded} : {e}"))?;
+    let filename = std::path::Path::new(&expanded)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fichier")
+        .to_string();
+    let mime_str = mime_from_ext(&expanded);
+    let mime_parsed: mime::Mime = mime_str
+        .parse()
+        .map_err(|_| format!("type MIME inconnu pour {expanded}"))?;
+    room.send_attachment(filename.clone(), &mime_parsed, bytes, AttachmentConfig::new())
+        .await?;
+    Ok(filename)
 }
 
 async fn recover_from_key(

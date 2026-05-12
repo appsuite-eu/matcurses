@@ -144,6 +144,8 @@ const SLASH_COMMANDS: &[&str] = &[
     "name",
     "nick",
     "avatar",
+    "upload",
+    "send",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1945,6 +1947,7 @@ impl App {
             "name" => self.moderation_name(args),
             "nick" => self.profile_nick(args),
             "avatar" => self.profile_avatar(args),
+            "upload" | "send" => self.upload_cmd(args),
             "redact" | "del" => self.open_redact_confirm(),
             "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
@@ -2026,6 +2029,35 @@ impl App {
                 invite: vec![target.to_string()],
             });
             self.flash = Some(format!("DM avec {target} en cours…"));
+        }
+    }
+
+    /// `/upload <chemin>` (alias `/send`) — send a local file as an
+    /// attachment to the active room. MIME type is inferred from the
+    /// extension; encrypted rooms encrypt the upload automatically.
+    pub fn upload_cmd(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/upload indisponible (hors session)".into());
+            return;
+        }
+        let path = args.trim();
+        if path.is_empty() {
+            self.flash = Some("/upload <chemin/vers/fichier>".into());
+            return;
+        }
+        let room_id = match self.current_room_id.clone() {
+            Some(id) => id,
+            None => {
+                self.flash = Some("/upload : aucune room active".into());
+                return;
+            }
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SendAttachment {
+                room_id,
+                path: path.to_string(),
+            });
+            self.flash = Some(format!("upload {path}…"));
         }
     }
 
@@ -2465,6 +2497,7 @@ impl App {
             "/name <texte>          renommer la room".into(),
             "/nick <texte>          changer ton display name".into(),
             "/avatar <chemin>       téléverser une image comme avatar".into(),
+            "/upload <chemin>       envoyer un fichier (alias /send)".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),
