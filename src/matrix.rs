@@ -1742,24 +1742,103 @@ async fn load_spaces(
     client: &Client,
     tx: &Sender<Update>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::collections::HashSet;
+    use futures_util::stream::StreamExt;
+    use matrix_sdk::room::ParentSpace;
+    use std::collections::{HashMap, HashSet};
+
     let mut visited: HashSet<String> = HashSet::new();
-    let mut roots = Vec::new();
-    // We treat every joinable space as a root: matrix-sdk doesn't expose a
-    // "top-level" notion, and in practice the user can join a sub-space
-    // directly, so we list them all and let the user sort it out.
+    let mut roots: Vec<UiNode> = Vec::new();
+    let mut joined_space_ids: HashSet<OwnedRoomId> = HashSet::new();
+
+    // Pass 1 — joined spaces (the common case for users who explicitly
+    // joined a community / space at the top level).
     for r in client.rooms() {
         if !r.is_space() {
             continue;
         }
         let space_id = r.room_id().to_string();
-        if visited.contains(&space_id) {
+        if !visited.insert(space_id.clone()) {
             continue;
         }
+        joined_space_ids.insert(r.room_id().to_owned());
         let node = build_space_node(client, &r, &mut visited).await;
         roots.push(node);
     }
-    // Rooms that don't belong to any space remain accessible via F4 (room list).
+
+    // Pass 2 — surface parents of joined rooms that the user did NOT
+    // explicitly join. This matters because matrix.org-style accounts
+    // often end up joined only to the leaf rooms of a community, not the
+    // community space itself; without this pass F3 would be empty even
+    // though the user clearly belongs to several spaces.
+    //
+    // For each joined non-space room we read its `m.space.parent` events
+    // (matrix-sdk's `parent_spaces()` already implements the spec walk).
+    // The result is grouped by parent id so a community shared by many
+    // rooms only shows up once.
+    let mut extra_parents: HashMap<OwnedRoomId, ParentSpace> = HashMap::new();
+    {
+        use futures_util::stream::FuturesUnordered;
+        let candidates: Vec<_> = client
+            .rooms()
+            .into_iter()
+            .filter(|r| !r.is_space() && matches!(r.state(), RoomState::Joined))
+            .collect();
+
+        // Fan out: each room's parent walk runs concurrently on the
+        // tokio pool. Sequential awaits here used to add up to seconds
+        // on accounts with 100+ joined rooms.
+        let mut per_room: FuturesUnordered<_> = candidates
+            .into_iter()
+            .map(|r| async move {
+                let stream = match r.parent_spaces().await {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                stream.collect::<Vec<_>>().await
+            })
+            .collect();
+
+        while let Some(parents) = per_room.next().await {
+            for parent in parents.into_iter().flatten() {
+                let id = match &parent {
+                    ParentSpace::Reciprocal(room) | ParentSpace::WithPowerlevel(room) => {
+                        room.room_id().to_owned()
+                    }
+                    ParentSpace::Unverifiable(id) => id.clone(),
+                    ParentSpace::Illegitimate(_) => continue,
+                };
+                if joined_space_ids.contains(&id) || visited.contains(&id.to_string()) {
+                    continue;
+                }
+                extra_parents.entry(id).or_insert(parent);
+            }
+        }
+    }
+
+    for (id, parent) in extra_parents {
+        visited.insert(id.to_string());
+        let node = match parent {
+            ParentSpace::Reciprocal(room) | ParentSpace::WithPowerlevel(room) => {
+                build_space_node(client, &room, &mut visited).await
+            }
+            ParentSpace::Unverifiable(rid) => UiNode {
+                label: format!("{rid} (non joint)"),
+                kind: UiNodeKind::Space {
+                    room_id: rid.to_string(),
+                    expanded: false,
+                    children: Vec::new(),
+                    loaded: false,
+                    via: Vec::new(),
+                },
+            },
+            ParentSpace::Illegitimate(_) => continue,
+        };
+        roots.push(node);
+    }
+
+    // Stable order so F3 doesn't flicker between reloads.
+    roots.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+
     let _ = tx.send(Update::Spaces { roots }).await;
     Ok(())
 }
