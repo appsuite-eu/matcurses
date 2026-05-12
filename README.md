@@ -126,6 +126,10 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/dm @user:server` | Open a 1:1 DM with `@user` |
 | `/invite @user:server` | Invite `@user` into the active room |
 | `/accept`, `/reject` | Accept or decline the pending invitation on the focused room (marked `[invite]`) |
+| `/kick @user [reason]` | Kick a user from the active room |
+| `/ban @user [reason]`, `/unban @user` | Ban / unban a user |
+| `/op @user [level]`, `/deop @user` | Adjust power level (default `op` = 50, `deop` = 0) |
+| `/topic <text>`, `/name <text>` | Change the room topic / display name |
 | `/redact`, `/del` | Redact the selected message |
 | `/edit` | Edit the selected message (same as `E`) |
 | `/react <emoji>` | React to the selected message |

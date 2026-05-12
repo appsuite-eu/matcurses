@@ -141,6 +141,32 @@ pub enum Command {
     /// Decline a pending invitation. The room is left and dropped from
     /// the local rooms list on the next sync.
     RejectInvite { room_id: String },
+    /// Kick a user from a room (revocable join). Requires `kick` power.
+    KickUser {
+        room_id: String,
+        user_id: String,
+        reason: Option<String>,
+    },
+    /// Ban a user from a room (durable). Requires `ban` power.
+    BanUser {
+        room_id: String,
+        user_id: String,
+        reason: Option<String>,
+    },
+    /// Lift a previous ban. Requires `ban` power.
+    UnbanUser { room_id: String, user_id: String },
+    /// Set or reset `user_id`'s power level in `room_id`. Spec levels:
+    /// 0 = normal, 50 = moderator, 100 = admin. Requires being above the
+    /// target level yourself.
+    SetPowerLevel {
+        room_id: String,
+        user_id: String,
+        level: i64,
+    },
+    /// Replace the room topic (an `m.room.topic` state event).
+    SetTopic { room_id: String, topic: String },
+    /// Replace the room name (an `m.room.name` state event).
+    SetRoomName { room_id: String, name: String },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -893,6 +919,126 @@ async fn matrix_main(
                                     })
                                     .await;
                             }
+                        }
+                    });
+                }
+            }
+            Command::KickUser { room_id, user_id, reason } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            kick_user(&c, &room_id, &user_id, reason.as_deref()).await
+                        {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/kick : {e}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("kické : {user_id}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::BanUser { room_id, user_id, reason } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            ban_user(&c, &room_id, &user_id, reason.as_deref()).await
+                        {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/ban : {e}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("banni : {user_id}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::UnbanUser { room_id, user_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = unban_user(&c, &room_id, &user_id).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/unban : {e}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("débanni : {user_id}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::SetPowerLevel { room_id, user_id, level } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            set_power_level(&c, &room_id, &user_id, level).await
+                        {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/op : {e}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("{user_id} → power level {level}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::SetTopic { room_id, topic } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = set_topic(&c, &room_id, &topic).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/topic : {e}"),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }
+            Command::SetRoomName { room_id, name } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = set_room_name(&c, &room_id, &name).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/name : {e}"),
+                                })
+                                .await;
                         }
                     });
                 }
@@ -2437,6 +2583,91 @@ async fn invite_user(
     let parsed_user: OwnedUserId = user_id.parse()?;
     let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
     room.invite_user_by_id(&parsed_user).await?;
+    Ok(())
+}
+
+async fn kick_user(
+    client: &Client,
+    room_id: &str,
+    user_id: &str,
+    reason: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::OwnedUserId;
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let parsed_user: OwnedUserId = user_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    room.kick_user(&parsed_user, reason).await?;
+    Ok(())
+}
+
+async fn ban_user(
+    client: &Client,
+    room_id: &str,
+    user_id: &str,
+    reason: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::OwnedUserId;
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let parsed_user: OwnedUserId = user_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    room.ban_user(&parsed_user, reason).await?;
+    Ok(())
+}
+
+async fn unban_user(
+    client: &Client,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::OwnedUserId;
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let parsed_user: OwnedUserId = user_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    room.unban_user(&parsed_user, None).await?;
+    Ok(())
+}
+
+/// Set `user_id`'s power level. Delegates to the SDK's
+/// `update_power_levels`, which fetches the current `m.room.power_levels`,
+/// patches the `users` map, and re-sends the state event. Setting back to
+/// the room's `users_default` removes the override entirely.
+async fn set_power_level(
+    client: &Client,
+    room_id: &str,
+    user_id: &str,
+    level: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::int;
+    use matrix_sdk::ruma::Int;
+    use matrix_sdk::ruma::OwnedUserId;
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let parsed_user: OwnedUserId = user_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    let level_int: Int = Int::try_from(level).unwrap_or_else(|_| int!(0));
+    room.update_power_levels(vec![(parsed_user.as_ref(), level_int)])
+        .await?;
+    Ok(())
+}
+
+async fn set_topic(
+    client: &Client,
+    room_id: &str,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("room introuvable")?;
+    room.set_room_topic(topic).await?;
+    Ok(())
+}
+
+async fn set_room_name(
+    client: &Client,
+    room_id: &str,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("room introuvable")?;
+    room.set_name(name.to_string()).await?;
     Ok(())
 }
 

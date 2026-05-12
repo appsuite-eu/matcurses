@@ -135,6 +135,13 @@ const SLASH_COMMANDS: &[&str] = &[
     "invite",
     "accept",
     "reject",
+    "kick",
+    "ban",
+    "unban",
+    "op",
+    "deop",
+    "topic",
+    "name",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1927,6 +1934,13 @@ impl App {
             "invite" => self.invite_cmd(args),
             "accept" => self.accept_invite_cmd(),
             "reject" => self.reject_invite_cmd(),
+            "kick" => self.moderation_kick(args),
+            "ban" => self.moderation_ban(args),
+            "unban" => self.moderation_unban(args),
+            "op" => self.moderation_op(args),
+            "deop" => self.moderation_deop(args),
+            "topic" => self.moderation_topic(args),
+            "name" => self.moderation_name(args),
             "redact" | "del" => self.open_redact_confirm(),
             "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
@@ -2008,6 +2022,172 @@ impl App {
                 invite: vec![target.to_string()],
             });
             self.flash = Some(format!("DM avec {target} en cours…"));
+        }
+    }
+
+    /// Shared validator for the moderation slash-commands. Returns the
+    /// active room id; or fires a flash and returns None when there's no
+    /// session or no focused room.
+    fn moderation_ctx(&mut self, label: &str) -> Option<String> {
+        if !self.matrix_logged_in {
+            self.flash = Some(format!("{label} indisponible (hors session)"));
+            return None;
+        }
+        match self.current_room_id.clone() {
+            Some(id) => Some(id),
+            None => {
+                self.flash = Some(format!("{label} : aucune room active"));
+                None
+            }
+        }
+    }
+
+    /// Parse `@user[:server] [optional reason / level…]` into the MXID
+    /// and the remainder. Returns None (with a flash) on malformed input.
+    fn parse_user_args(&mut self, args: &str, usage: &str) -> Option<(String, String)> {
+        let trimmed = args.trim();
+        let (target, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((t, r)) => (t, r.trim().to_string()),
+            None => (trimmed, String::new()),
+        };
+        if target.is_empty() || !target.starts_with('@') || !target.contains(':') {
+            self.flash = Some(usage.to_string());
+            return None;
+        }
+        Some((target.to_string(), rest))
+    }
+
+    pub fn moderation_kick(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/kick") {
+            Some(id) => id,
+            None => return,
+        };
+        let (user_id, reason) = match self.parse_user_args(args, "/kick @user:server [raison]") {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::KickUser {
+                room_id,
+                user_id,
+                reason: if reason.is_empty() { None } else { Some(reason) },
+            });
+        }
+    }
+
+    pub fn moderation_ban(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/ban") {
+            Some(id) => id,
+            None => return,
+        };
+        let (user_id, reason) = match self.parse_user_args(args, "/ban @user:server [raison]") {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::BanUser {
+                room_id,
+                user_id,
+                reason: if reason.is_empty() { None } else { Some(reason) },
+            });
+        }
+    }
+
+    pub fn moderation_unban(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/unban") {
+            Some(id) => id,
+            None => return,
+        };
+        let (user_id, _) = match self.parse_user_args(args, "/unban @user:server") {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::UnbanUser { room_id, user_id });
+        }
+    }
+
+    /// `/op @user [level]` — defaults to 50 (moderator). Level 100 is admin.
+    pub fn moderation_op(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/op") {
+            Some(id) => id,
+            None => return,
+        };
+        let (user_id, rest) = match self.parse_user_args(args, "/op @user:server [niveau]") {
+            Some(p) => p,
+            None => return,
+        };
+        let level: i64 = if rest.is_empty() {
+            50
+        } else {
+            match rest.parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    self.flash = Some(format!("/op : '{rest}' n'est pas un entier"));
+                    return;
+                }
+            }
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetPowerLevel {
+                room_id,
+                user_id,
+                level,
+            });
+        }
+    }
+
+    /// `/deop @user` — shorthand for `/op @user 0` (back to default).
+    pub fn moderation_deop(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/deop") {
+            Some(id) => id,
+            None => return,
+        };
+        let (user_id, _) = match self.parse_user_args(args, "/deop @user:server") {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetPowerLevel {
+                room_id,
+                user_id,
+                level: 0,
+            });
+        }
+    }
+
+    /// `/topic <texte>` — set the active room's topic. Empty argument
+    /// clears the topic (the spec allows that).
+    pub fn moderation_topic(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/topic") {
+            Some(id) => id,
+            None => return,
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetTopic {
+                room_id,
+                topic: args.trim().to_string(),
+            });
+        }
+    }
+
+    /// `/name <texte>` — rename the active room. Empty argument refused
+    /// to avoid accidentally clearing the display name.
+    pub fn moderation_name(&mut self, args: &str) {
+        let room_id = match self.moderation_ctx("/name") {
+            Some(id) => id,
+            None => return,
+        };
+        let name = args.trim();
+        if name.is_empty() {
+            self.flash = Some("/name <nom>".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetRoomName {
+                room_id,
+                name: name.to_string(),
+            });
         }
     }
 
@@ -2238,6 +2418,13 @@ impl App {
             "/invite @user:server   inviter un utilisateur dans la room".into(),
             "/accept                accepter l'invitation focalisée".into(),
             "/reject                refuser l'invitation focalisée".into(),
+            "/kick @user [raison]   exclure un utilisateur (révocable)".into(),
+            "/ban @user [raison]    bannir un utilisateur".into(),
+            "/unban @user           lever un bannissement".into(),
+            "/op @user [niveau]     donner les droits (défaut 50)".into(),
+            "/deop @user            retirer les droits".into(),
+            "/topic <texte>         définir le sujet de la room".into(),
+            "/name <texte>          renommer la room".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),
