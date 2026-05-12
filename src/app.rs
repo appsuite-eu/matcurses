@@ -146,6 +146,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "avatar",
     "upload",
     "send",
+    "status",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2009,6 +2010,7 @@ impl App {
             "nick" => self.profile_nick(args),
             "avatar" => self.profile_avatar(args),
             "upload" | "send" => self.upload_cmd(args),
+            "status" => self.status_cmd(args),
             "redact" | "del" => self.open_redact_confirm(),
             "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
@@ -2090,6 +2092,32 @@ impl App {
                 invite: vec![target.to_string()],
             });
             self.flash = Some(format!("DM avec {target} en cours…"));
+        }
+    }
+
+    /// `/status <état> [message]` — update your presence and optional
+    /// status message. Accepted states: `online` (active), `away` /
+    /// `idle` / `unavailable`, `offline` / `invisible`. Argument-free
+    /// form prints the usage hint.
+    pub fn status_cmd(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/status indisponible (hors session)".into());
+            return;
+        }
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.flash = Some("/status online|away|offline [message]".into());
+            return;
+        }
+        let (state, msg) = match trimmed.split_once(char::is_whitespace) {
+            Some((s, m)) => (s.to_string(), Some(m.trim().to_string())),
+            None => (trimmed.to_string(), None),
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetPresence {
+                state,
+                status_msg: msg.filter(|s| !s.is_empty()),
+            });
         }
     }
 
@@ -2559,6 +2587,7 @@ impl App {
             "/nick <texte>          changer ton display name".into(),
             "/avatar <chemin>       téléverser une image comme avatar".into(),
             "/upload <chemin>       envoyer un fichier (alias /send)".into(),
+            "/status <état> [msg]   présence : online · away · offline".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),

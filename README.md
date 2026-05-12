@@ -134,6 +134,7 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/nick <text>` | Set your own display name (empty clears it) |
 | `/avatar <path>` | Upload a local image (PNG / JPEG / GIF / WebP) as your avatar |
 | `/upload <path>` (alias `/send`) | Send a local file as an attachment (encrypted automatically in E2EE rooms) |
+| `/status <state> [message]` | Set presence: `online` / `away` (= `idle` / `unavailable`) / `offline` (= `invisible`), with an optional status message |
 | `/redact`, `/del` | Redact the selected message |
 | `/edit` | Edit the selected message (same as `E`) |
 | `/react <emoji>` | React to the selected message |

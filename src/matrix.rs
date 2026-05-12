@@ -181,6 +181,13 @@ pub enum Command {
     /// Voice-note audio is intentionally also accepted — useful for
     /// keeping the file rather than just streaming.
     SaveAttachment { room_id: String, event_id: String },
+    /// Update the local user's presence state and optional status
+    /// message. `state` is one of "online" / "unavailable" / "offline";
+    /// `status_msg = None` clears the message.
+    SetPresence {
+        state: String,
+        status_msg: Option<String>,
+    },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -1053,6 +1060,34 @@ async fn matrix_main(
                                     reason: format!("/name : {e}"),
                                 })
                                 .await;
+                        }
+                    });
+                }
+            }
+            Command::SetPresence { state, status_msg } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match set_presence(&c, &state, status_msg.as_deref()).await {
+                            Ok(()) => {
+                                let label = match status_msg.as_deref() {
+                                    Some(m) if !m.is_empty() => {
+                                        format!("présence : {state} · {m}")
+                                    }
+                                    _ => format!("présence : {state}"),
+                                };
+                                let _ = tx
+                                    .send(Update::Error { reason: label })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/status : {e}"),
+                                    })
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -3154,6 +3189,41 @@ fn event_content_to_message(
 
 /// Fetch the audio bytes for a given event (auto-decrypts E2EE attachments
 /// via the SDK). Returns the raw bytes and the optional mime type.
+/// Set the local user's presence + status message. Spec values for the
+/// state: "online" (active), "unavailable" (idle / away), "offline"
+/// (appears offline). Anything else is rejected with a friendly error so
+/// the user knows the slash command was malformed.
+async fn set_presence(
+    client: &Client,
+    state: &str,
+    status_msg: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::api::client::presence::set_presence;
+    use matrix_sdk::ruma::presence::PresenceState;
+
+    let user_id = client
+        .user_id()
+        .ok_or("pas d'utilisateur connecté")?
+        .to_owned();
+    let parsed_state = match state.trim().to_ascii_lowercase().as_str() {
+        "online" | "actif" | "active" => PresenceState::Online,
+        "unavailable" | "idle" | "away" | "absent" | "afk" => PresenceState::Unavailable,
+        "offline" | "invisible" | "hors-ligne" => PresenceState::Offline,
+        other => return Err(format!("présence inconnue : '{other}'").into()),
+    };
+    let mut request = set_presence::v3::Request::new(user_id, parsed_state);
+    request.status_msg = status_msg.and_then(|m| {
+        let trimmed = m.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    client.send(request).await?;
+    Ok(())
+}
+
 /// Download the media bytes of `event_id` and write them to a stable
 /// location on disk (preferring `~/Downloads/`, falling back to the
 /// system temp dir). Opens the result with the OS handler so the user
