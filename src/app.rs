@@ -842,6 +842,67 @@ impl App {
         out
     }
 
+    /// Save the attachment of the focused message (file / image / audio
+    /// / video, including voice notes) to disk and open it with the OS
+    /// handler. No-op on plain text messages; the bridge reports the
+    /// saved path via flash.
+    pub fn save_current_attachment(&mut self) {
+        let item = match self.current_item() {
+            Some(it) => it,
+            None => return,
+        };
+        let (blocks, event_id) = match item.kind {
+            ItemKind::Top => {
+                let m = match self.messages.get(item.msg_idx) {
+                    Some(m) => m,
+                    None => return,
+                };
+                (&m.blocks, m.event_id.clone())
+            }
+            ItemKind::Reply => {
+                let m = match self.messages.get(item.msg_idx) {
+                    Some(m) => m,
+                    None => return,
+                };
+                let r = match m.replies.get(item.reply_idx) {
+                    Some(r) => r,
+                    None => return,
+                };
+                (&r.blocks, r.event_id.clone())
+            }
+        };
+        // Heuristic: voice → first-class block; other media → rendered as
+        // a Text block starting with the spec-side label. Both indicate an
+        // attachment we know how to download.
+        let has_media = blocks.iter().any(|b| match b {
+            Block::Voice { .. } => true,
+            Block::Text(t) => {
+                t.starts_with("[fichier") || t.starts_with("[image") || t.starts_with("[vidéo")
+            }
+            Block::Code(_) => false,
+        });
+        if !has_media {
+            self.flash = Some("rien à sauvegarder ici".into());
+            return;
+        }
+        if event_id.is_empty() {
+            return;
+        }
+        match (
+            self.matrix_logged_in,
+            self.current_room_id.clone(),
+            self.matrix.as_ref(),
+        ) {
+            (true, Some(room_id), Some(b)) => {
+                b.send(MxCommand::SaveAttachment { room_id, event_id });
+                self.flash = Some("téléchargement…".into());
+            }
+            _ => {
+                self.flash = Some("hors session".into());
+            }
+        }
+    }
+
     pub fn play_current_voice(&mut self) {
         let item = match self.current_item() {
             Some(it) => it,

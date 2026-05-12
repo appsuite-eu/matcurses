@@ -176,6 +176,11 @@ pub enum Command {
     /// m.audio / m.video / m.file) is derived from the MIME type. In an
     /// encrypted room the SDK encrypts the upload transparently.
     SendAttachment { room_id: String, path: String },
+    /// Download the attachment of a given event (file / image / audio /
+    /// video), write it to disk, and open it with the system handler.
+    /// Voice-note audio is intentionally also accepted — useful for
+    /// keeping the file rather than just streaming.
+    SaveAttachment { room_id: String, event_id: String },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -1048,6 +1053,30 @@ async fn matrix_main(
                                     reason: format!("/name : {e}"),
                                 })
                                 .await;
+                        }
+                    });
+                }
+            }
+            Command::SaveAttachment { room_id, event_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match save_attachment(&c, &room_id, &event_id).await {
+                            Ok(path) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("sauvé : {}", path.display()),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("sauvegarde : {e}"),
+                                    })
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -3125,6 +3154,145 @@ fn event_content_to_message(
 
 /// Fetch the audio bytes for a given event (auto-decrypts E2EE attachments
 /// via the SDK). Returns the raw bytes and the optional mime type.
+/// Download the media bytes of `event_id` and write them to a stable
+/// location on disk (preferring `~/Downloads/`, falling back to the
+/// system temp dir). Opens the result with the OS handler so the user
+/// gets the file in their default viewer. Works for File / Image / Audio
+/// / Video msgtypes; voice notes (also m.audio) are accepted on purpose
+/// so users can keep what they're listening to.
+async fn save_attachment(
+    client: &Client,
+    room_id: &str,
+    event_id: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    let parsed_event: OwnedEventId = event_id.parse()?;
+
+    let timeline_event = room.event(&parsed_event, None).await?;
+    let raw = timeline_event.raw().deserialize()?;
+
+    use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+    let (source, mime, filename) = match raw {
+        AnySyncTimelineEvent::MessageLike(ml) => match ml.original_content() {
+            Some(AnyMessageLikeEventContent::RoomMessage(rmc)) => match rmc.msgtype {
+                MessageType::File(f) => {
+                    let mime = f.info.as_ref().and_then(|i| i.mimetype.clone());
+                    (f.source.clone(), mime, f.body.clone())
+                }
+                MessageType::Image(i) => {
+                    let mime = i.info.as_ref().and_then(|x| x.mimetype.clone());
+                    (i.source.clone(), mime, i.body.clone())
+                }
+                MessageType::Audio(a) => {
+                    let mime = a.info.as_ref().and_then(|i| i.mimetype.clone());
+                    (a.source.clone(), mime, a.body.clone())
+                }
+                MessageType::Video(v) => {
+                    let mime = v.info.as_ref().and_then(|i| i.mimetype.clone());
+                    (v.source.clone(), mime, v.body.clone())
+                }
+                _ => return Err("rien à sauvegarder ici".into()),
+            },
+            _ => return Err("event sans contenu décryptable".into()),
+        },
+        _ => return Err("event inattendu".into()),
+    };
+
+    let request = MediaRequestParameters {
+        source,
+        format: MediaFormat::File,
+    };
+    let bytes = client.media().get_media_content(&request, true).await?;
+
+    // Sanitize the spec-side body (which acts as the suggested filename),
+    // then drop into ~/Downloads if it exists, otherwise the temp dir.
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.trim().is_empty() {
+        // Pick an extension from the MIME so the OS handler can dispatch.
+        format!("matcurses-{}.{}", event_id_short(event_id), ext_for_mime(mime.as_deref()))
+    } else {
+        safe
+    };
+    let dir = downloads_dir().unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = unique_path(dir.join(safe));
+    std::fs::write(&path, &bytes)?;
+
+    // Best-effort open: failure here is non-fatal; the file is on disk
+    // and the flash includes the path, so the user can navigate to it.
+    open_with_system(&path);
+
+    Ok(path)
+}
+
+/// Resolve `~/Downloads` (or `$XDG_DOWNLOAD_DIR` on Linux when set).
+/// Returns None when the directory doesn't exist; callers fall back to
+/// `std::env::temp_dir()`.
+fn downloads_dir() -> Option<std::path::PathBuf> {
+    dirs::download_dir().filter(|p| p.exists())
+}
+
+/// Append `-1`, `-2`, … before the extension until we land on a path
+/// that doesn't already exist. Avoids silently clobbering a previous
+/// download with the same suggested filename.
+fn unique_path(initial: std::path::PathBuf) -> std::path::PathBuf {
+    if !initial.exists() {
+        return initial;
+    }
+    let stem = initial
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = initial
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let parent = initial.parent().unwrap_or(std::path::Path::new("."));
+    for i in 1..1000 {
+        let candidate = parent.join(format!("{stem}-{i}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    initial
+}
+
+fn event_id_short(event_id: &str) -> String {
+    event_id
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(12)
+        .collect()
+}
+
+fn open_with_system(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", path.to_str().unwrap_or("")])
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new(opener).arg(path).spawn();
+    }
+}
+
 async fn download_voice(
     client: &Client,
     room_id: &str,

@@ -79,6 +79,7 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `v` / `V` | Play / stop voice note |
 | `Space` | Pause / resume the active voice note |
 | `Esc` | Stop the active voice note |
+| `s` | Save attachment (file / image / audio / video) to `~/Downloads` and open with OS handler |
 | `(` / `)` | Slow down / speed up voice playback (0.25× steps, 0.5×–2.0×) |
 | `e` | Open the message body in `$EDITOR` |
 | `/` / `?` | Search forward / backward |

@@ -263,6 +263,10 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('t') => app.start_thread(),
         KeyCode::Char('v') => app.play_current_voice(),
         KeyCode::Char('V') => app.stop_voice(),
+        // `s` = save the attachment of the selected message (file /
+        // image / audio / video) to ~/Downloads and open it. No-op on
+        // a plain text message.
+        KeyCode::Char('s') => app.save_current_attachment(),
         // Voice playback transport: Space pauses/resumes the active voice
         // note, Esc stops it, `(` and `)` adjust speed by 0.25× (clamped
         // 0.5..=2.0). Esc and Space stay no-ops when no voice is playing,
