@@ -667,6 +667,49 @@ impl App {
         }));
     }
 
+    /// Pop a 3-button modal asking what to do with the pending invitation
+    /// on `room_id`. Triggered by Enter on a `[invite]`-marked row in F4,
+    /// or by Enter on an invited node in the spaces tree.
+    pub fn open_invite_confirm(&mut self, room_id: String, display_name: String) {
+        self.modal = Some(Modal::InviteConfirm(crate::modal::InviteConfirmModal {
+            room_id,
+            display_name,
+            focused: crate::modal::InviteAction::Accept,
+        }));
+    }
+
+    /// Modal action: accept the invitation and switch into the room as
+    /// soon as the join lands (`pending_open_after_join` does the deferred
+    /// switch on the next Rooms snapshot).
+    pub fn invite_modal_accept(&mut self) {
+        let room_id = match &self.modal {
+            Some(Modal::InviteConfirm(m)) => m.room_id.clone(),
+            _ => return,
+        };
+        self.modal = None;
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::AcceptInvite {
+                room_id: room_id.clone(),
+            });
+            self.pending_open_after_join = Some(room_id);
+            self.flash = Some("acceptation en cours…".into());
+        }
+    }
+
+    /// Modal action: decline the invitation; the room drops off the list
+    /// on the next sync.
+    pub fn invite_modal_reject(&mut self) {
+        let room_id = match &self.modal {
+            Some(Modal::InviteConfirm(m)) => m.room_id.clone(),
+            _ => return,
+        };
+        self.modal = None;
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::RejectInvite { room_id });
+            self.flash = Some("invitation refusée".into());
+        }
+    }
+
     pub fn open_redact_confirm(&mut self) {
         let item = match self.current_item() {
             Some(it) => it,

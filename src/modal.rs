@@ -55,6 +55,23 @@ pub enum Modal {
     SasVerification(SasVerificationModal),
     WindowList(WindowListModal),
     PublicRooms(PublicRoomsModal),
+    InviteConfirm(InviteConfirmModal),
+}
+
+/// Three-way modal shown when the user presses Enter on a room that's
+/// still an outstanding invitation. Buttons map to the matching slash
+/// commands; Cancel does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteAction {
+    Accept,
+    Reject,
+    Cancel,
+}
+
+pub struct InviteConfirmModal {
+    pub room_id: String,
+    pub display_name: String,
+    pub focused: InviteAction,
 }
 
 pub struct PublicRoomsModal {
@@ -123,6 +140,77 @@ pub fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) -> ModalCursor {
         Modal::SasVerification(m) => draw_sas_verification(frame, area, m),
         Modal::WindowList(m) => draw_window_list(frame, area, m),
         Modal::PublicRooms(m) => draw_public_rooms(frame, area, m),
+        Modal::InviteConfirm(m) => draw_invite_confirm(frame, area, m),
+    }
+}
+
+fn draw_invite_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    m: &InviteConfirmModal,
+) -> ModalCursor {
+    let title = format!("Invitation : {}", m.display_name);
+    let inner = render_modal_frame(
+        frame,
+        area,
+        &ModalFrame {
+            title: &title,
+            footer: Some("←→ ou Tab: changer · Entrée: choisir · Esc: annuler"),
+        },
+    );
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            Line::raw(format!("Tu as été invité dans {}.", m.display_name)),
+            Line::raw("Que veux-tu faire ?"),
+            Line::raw(""),
+        ]),
+        inner,
+    );
+
+    let accept_label = "[ Accepter ]";
+    let reject_label = "[ Refuser ]";
+    let cancel_label = "[ Annuler ]";
+    let mk_style = |b: InviteAction| {
+        if m.focused == b {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        }
+    };
+
+    let gap = 3u16;
+    let accept_w = accept_label.chars().count() as u16;
+    let reject_w = reject_label.chars().count() as u16;
+    let cancel_w = cancel_label.chars().count() as u16;
+    let buttons_total = accept_w + gap + reject_w + gap + cancel_w;
+    let buttons_y = inner.y + 4;
+    let buttons_x = inner.x + inner.width.saturating_sub(buttons_total) / 2;
+    let buttons_area = Rect {
+        x: buttons_x,
+        y: buttons_y,
+        width: buttons_total.min(inner.width),
+        height: 1,
+    };
+    let line = Line::from(vec![
+        Span::styled(accept_label, mk_style(InviteAction::Accept)),
+        Span::raw(" ".repeat(gap as usize)),
+        Span::styled(reject_label, mk_style(InviteAction::Reject)),
+        Span::raw(" ".repeat(gap as usize)),
+        Span::styled(cancel_label, mk_style(InviteAction::Cancel)),
+    ]);
+    frame.render_widget(Paragraph::new(line), buttons_area);
+
+    let label_offset = 2u16;
+    let cursor_x = match m.focused {
+        InviteAction::Accept => buttons_x + label_offset,
+        InviteAction::Reject => buttons_x + accept_w + gap + label_offset,
+        InviteAction::Cancel => buttons_x + accept_w + gap + reject_w + gap + label_offset,
+    };
+    ModalCursor {
+        x: cursor_x,
+        y: buttons_y,
     }
 }
 

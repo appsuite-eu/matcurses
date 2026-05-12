@@ -126,7 +126,7 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/create [name]` | Create a new private room |
 | `/dm @user:server` | Open a 1:1 DM with `@user` |
 | `/invite @user:server` | Invite `@user` into the active room |
-| `/accept`, `/reject` | Accept or decline the pending invitation on the focused room (marked `[invite]`) |
+| `/accept`, `/reject` | Accept or decline the pending invitation on the focused room (marked `[invite]`). Pressing Enter on an `[invite]` row in F4 also pops a 3-button modal (Accept / Refuse / Cancel) |
 | `/kick @user [reason]` | Kick a user from the active room |
 | `/ban @user [reason]`, `/unban @user` | Ban / unban a user |
 | `/op @user [level]`, `/deop @user` | Adjust power level (default `op` = 50, `deop` = 0) |

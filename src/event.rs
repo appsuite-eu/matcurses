@@ -159,6 +159,31 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> EventOutcome {
             KeyCode::Enter => app.pick_window_from_list(),
             _ => {}
         },
+        Modal::InviteConfirm(m) => {
+            let cycle_left = |f: crate::modal::InviteAction| match f {
+                crate::modal::InviteAction::Accept => crate::modal::InviteAction::Cancel,
+                crate::modal::InviteAction::Reject => crate::modal::InviteAction::Accept,
+                crate::modal::InviteAction::Cancel => crate::modal::InviteAction::Reject,
+            };
+            let cycle_right = |f: crate::modal::InviteAction| match f {
+                crate::modal::InviteAction::Accept => crate::modal::InviteAction::Reject,
+                crate::modal::InviteAction::Reject => crate::modal::InviteAction::Cancel,
+                crate::modal::InviteAction::Cancel => crate::modal::InviteAction::Accept,
+            };
+            match key.code {
+                KeyCode::Esc => app.close_modal(),
+                KeyCode::Left | KeyCode::BackTab => m.focused = cycle_left(m.focused),
+                KeyCode::Right | KeyCode::Tab => m.focused = cycle_right(m.focused),
+                KeyCode::Char('a') | KeyCode::Char('A') => app.invite_modal_accept(),
+                KeyCode::Char('r') | KeyCode::Char('R') => app.invite_modal_reject(),
+                KeyCode::Enter => match m.focused {
+                    crate::modal::InviteAction::Accept => app.invite_modal_accept(),
+                    crate::modal::InviteAction::Reject => app.invite_modal_reject(),
+                    crate::modal::InviteAction::Cancel => app.close_modal(),
+                },
+                _ => {}
+            }
+        }
         Modal::PublicRooms(m) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.close_modal(),
             KeyCode::Up => m.selected = m.selected.saturating_sub(1),
@@ -319,6 +344,25 @@ fn handle_room_list_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         return EventOutcome::Continue;
     }
     if key.code == KeyCode::Enter {
+        // Pending invitations open a 3-button modal (Accept / Reject /
+        // Cancel) instead of trying to load the timeline, which would
+        // 403 since we're not joined yet.
+        let selected = app.room_list_state.list.selected;
+        let invited = app
+            .room_list_state
+            .rooms
+            .get(selected)
+            .map(|r| r.invited)
+            .unwrap_or(false);
+        if invited {
+            if let (Some(name), Some(id)) = (
+                app.room_list_state.selected_room_name(),
+                app.room_ids.get(selected).cloned(),
+            ) {
+                app.open_invite_confirm(id, name);
+                return EventOutcome::Continue;
+            }
+        }
         if let Some(name) = app.room_list_state.selected_room_name() {
             app.switch_room(&name);
         }
