@@ -2245,17 +2245,44 @@ async fn run_sync(
     let _ = tx.send(snapshot_rooms(&client).await).await;
     let _ = tx.send(Update::SyncComplete).await;
 
+    // Kick off an eager spaces load right after the initial sync lands.
+    // The hierarchy endpoint can be slow (multiple federated calls), so
+    // we spawn it instead of blocking — by the time the user reaches F3
+    // the tree is usually already populated. Subsequent re-loads are
+    // driven from the continuous-sync callback below, gated on the count
+    // of space-typed rooms actually changing.
+    {
+        let c = client.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = load_spaces(&c, &tx).await {
+                let _ = tx
+                    .send(Update::Error {
+                        reason: format!("spaces (initial) : {e}"),
+                    })
+                    .await;
+            }
+        });
+    }
+
     // Continuous sync: push a rooms snapshot after each iteration so the UI
     // reflects new rooms in real time (including those created by bridges
     // like mautrix-whatsapp), unread count changes, name changes, etc.
     let tx_cb = tx.clone();
     let client_cb = client.clone();
     let cur_cb = current_room.clone();
+    // Tracks the set of space room ids we've already crawled. If the
+    // sync iteration changes it (new space joined, space removed), we
+    // re-run load_spaces in the background so F3 stays current without
+    // user intervention.
+    let last_space_ids: Arc<tokio::sync::Mutex<std::collections::BTreeSet<OwnedRoomId>>> =
+        Arc::new(tokio::sync::Mutex::new(current_space_ids(&client)));
     let result = client
         .sync_with_callback(settings, move |response| {
             let tx = tx_cb.clone();
             let c = client_cb.clone();
             let cur = cur_cb.clone();
+            let last_space_ids = last_space_ids.clone();
             async move {
                 let _ = tx.send(snapshot_rooms(&c).await).await;
                 // Safety net for the live SyncRoomMessageEvent handler:
@@ -2271,6 +2298,20 @@ async fn run_sync(
                         }
                     }
                 }
+                // Detect "space set changed" cheaply (BTreeSet diff) and
+                // refresh F3's data in the background. The hierarchy
+                // crawl is expensive; gating prevents hammering it.
+                let now = current_space_ids(&c);
+                let mut guard = last_space_ids.lock().await;
+                if *guard != now {
+                    *guard = now;
+                    drop(guard);
+                    let c = c.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = load_spaces(&c, &tx).await;
+                    });
+                }
                 matrix_sdk::LoopCtrl::Continue
             }
         })
@@ -2282,6 +2323,19 @@ async fn run_sync(
             })
             .await;
     }
+}
+
+/// Cheap snapshot of "which spaces are we joined to right now". Used
+/// by the continuous-sync callback to decide whether the F3 tree needs
+/// re-crawling. Walks `client.rooms()` (in-memory) without hitting
+/// the network.
+fn current_space_ids(client: &Client) -> std::collections::BTreeSet<OwnedRoomId> {
+    client
+        .rooms()
+        .into_iter()
+        .filter(|r| r.is_space())
+        .map(|r| r.room_id().to_owned())
+        .collect()
 }
 
 /// Synchronous rooms snapshot (run on the tokio side).
