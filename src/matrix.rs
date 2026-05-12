@@ -167,6 +167,11 @@ pub enum Command {
     SetTopic { room_id: String, topic: String },
     /// Replace the room name (an `m.room.name` state event).
     SetRoomName { room_id: String, name: String },
+    /// Update the local user's display name. `name = ""` clears it.
+    SetDisplayName { name: String },
+    /// Upload the given local file as the local user's avatar and point
+    /// the account at the resulting MXC URI.
+    SetAvatar { path: String },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -1039,6 +1044,62 @@ async fn matrix_main(
                                     reason: format!("/name : {e}"),
                                 })
                                 .await;
+                        }
+                    });
+                }
+            }
+            Command::SetDisplayName { name } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        let new_name = if name.trim().is_empty() {
+                            None
+                        } else {
+                            Some(name.trim().to_string())
+                        };
+                        match c.account().set_display_name(new_name.as_deref()).await {
+                            Ok(()) => {
+                                let label = new_name
+                                    .clone()
+                                    .unwrap_or_else(|| "(vide)".to_string());
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("display name : {label}"),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/nick : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::SetAvatar { path } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match upload_avatar(&c, &path).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: "avatar mis à jour".into(),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/avatar : {e}"),
+                                    })
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -2669,6 +2730,52 @@ async fn set_room_name(
     let room = client.get_room(&parsed).ok_or("room introuvable")?;
     room.set_name(name.to_string()).await?;
     Ok(())
+}
+
+/// Read `path`, infer the MIME type from the extension, upload to the
+/// homeserver's media repo, and bind the resulting MXC to the local
+/// account's avatar URL.
+async fn upload_avatar(
+    client: &Client,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    };
+    let bytes = std::fs::read(&expanded)
+        .map_err(|e| format!("lecture {expanded} : {e}"))?;
+    let mime = mime_from_ext(&expanded);
+    let parsed_mime: mime::Mime = mime
+        .parse()
+        .map_err(|_| format!("type MIME inconnu pour {expanded}"))?;
+    client
+        .account()
+        .upload_avatar(&parsed_mime, bytes)
+        .await?;
+    Ok(())
+}
+
+/// Minimal MIME sniffer based on the file extension. Avatars are
+/// typically PNG/JPEG/GIF/WebP; anything else gets rejected upstream by
+/// the homeserver.
+fn mime_from_ext(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 async fn recover_from_key(

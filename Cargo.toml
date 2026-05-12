@@ -30,3 +30,4 @@ arboard = "3"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 shell-words = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+mime = "0.3"

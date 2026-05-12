@@ -130,6 +130,8 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/ban @user [reason]`, `/unban @user` | Ban / unban a user |
 | `/op @user [level]`, `/deop @user` | Adjust power level (default `op` = 50, `deop` = 0) |
 | `/topic <text>`, `/name <text>` | Change the room topic / display name |
+| `/nick <text>` | Set your own display name (empty clears it) |
+| `/avatar <path>` | Upload a local image (PNG / JPEG / GIF / WebP) as your avatar |
 | `/redact`, `/del` | Redact the selected message |
 | `/edit` | Edit the selected message (same as `E`) |
 | `/react <emoji>` | React to the selected message |

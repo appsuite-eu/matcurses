@@ -142,6 +142,8 @@ const SLASH_COMMANDS: &[&str] = &[
     "deop",
     "topic",
     "name",
+    "nick",
+    "avatar",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1941,6 +1943,8 @@ impl App {
             "deop" => self.moderation_deop(args),
             "topic" => self.moderation_topic(args),
             "name" => self.moderation_name(args),
+            "nick" => self.profile_nick(args),
+            "avatar" => self.profile_avatar(args),
             "redact" | "del" => self.open_redact_confirm(),
             "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
@@ -2022,6 +2026,40 @@ impl App {
                 invite: vec![target.to_string()],
             });
             self.flash = Some(format!("DM avec {target} en cours…"));
+        }
+    }
+
+    /// `/nick <texte>` — change the local user's display name. Empty
+    /// argument clears the name (the homeserver falls back to the MXID).
+    pub fn profile_nick(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/nick indisponible (hors session)".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetDisplayName {
+                name: args.trim().to_string(),
+            });
+        }
+    }
+
+    /// `/avatar <chemin>` — upload a local image file as the avatar.
+    /// Supported MIME types: PNG, JPEG, GIF, WebP.
+    pub fn profile_avatar(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/avatar indisponible (hors session)".into());
+            return;
+        }
+        let path = args.trim();
+        if path.is_empty() {
+            self.flash = Some("/avatar <chemin/vers/image.png>".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::SetAvatar {
+                path: path.to_string(),
+            });
+            self.flash = Some("upload avatar…".into());
         }
     }
 
@@ -2425,6 +2463,8 @@ impl App {
             "/deop @user            retirer les droits".into(),
             "/topic <texte>         définir le sujet de la room".into(),
             "/name <texte>          renommer la room".into(),
+            "/nick <texte>          changer ton display name".into(),
+            "/avatar <chemin>       téléverser une image comme avatar".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),
