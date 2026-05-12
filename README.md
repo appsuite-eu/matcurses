@@ -125,6 +125,7 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/create [name]` | Create a new private room |
 | `/dm @user:server` | Open a 1:1 DM with `@user` |
 | `/invite @user:server` | Invite `@user` into the active room |
+| `/accept`, `/reject` | Accept or decline the pending invitation on the focused room (marked `[invite]`) |
 | `/redact`, `/del` | Redact the selected message |
 | `/edit` | Edit the selected message (same as `E`) |
 | `/react <emoji>` | React to the selected message |

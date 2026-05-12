@@ -133,6 +133,8 @@ const SLASH_COMMANDS: &[&str] = &[
     "create",
     "dm",
     "invite",
+    "accept",
+    "reject",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1923,6 +1925,8 @@ impl App {
             "create" => self.create_room_cmd(args),
             "dm" => self.dm_cmd(args),
             "invite" => self.invite_cmd(args),
+            "accept" => self.accept_invite_cmd(),
+            "reject" => self.reject_invite_cmd(),
             "redact" | "del" => self.open_redact_confirm(),
             "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
@@ -2004,6 +2008,46 @@ impl App {
                 invite: vec![target.to_string()],
             });
             self.flash = Some(format!("DM avec {target} en cours…"));
+        }
+    }
+
+    /// `/accept` — accept the pending invitation on the active room. The
+    /// room list is refreshed after the join lands so the `[invite]` marker
+    /// goes away.
+    pub fn accept_invite_cmd(&mut self) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/accept indisponible (hors session)".into());
+            return;
+        }
+        let room_id = match self.current_room_id.clone() {
+            Some(id) => id,
+            None => {
+                self.flash = Some("/accept : aucune invitation focalisée".into());
+                return;
+            }
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::AcceptInvite { room_id });
+            self.flash = Some("acceptation en cours…".into());
+        }
+    }
+
+    /// `/reject` — decline the pending invitation on the active room.
+    pub fn reject_invite_cmd(&mut self) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/reject indisponible (hors session)".into());
+            return;
+        }
+        let room_id = match self.current_room_id.clone() {
+            Some(id) => id,
+            None => {
+                self.flash = Some("/reject : aucune invitation focalisée".into());
+                return;
+            }
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::RejectInvite { room_id });
+            self.flash = Some("invitation refusée".into());
         }
     }
 
@@ -2192,6 +2236,8 @@ impl App {
             "/create [nom]          créer une nouvelle room privée".into(),
             "/dm @user:server       ouvrir un DM 1:1".into(),
             "/invite @user:server   inviter un utilisateur dans la room".into(),
+            "/accept                accepter l'invitation focalisée".into(),
+            "/reject                refuser l'invitation focalisée".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),

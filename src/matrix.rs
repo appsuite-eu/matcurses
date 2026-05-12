@@ -136,6 +136,11 @@ pub enum Command {
     /// Invite a user to the given room. Requires the local user to have
     /// at least the `invite` power level there.
     InviteUser { room_id: String, user_id: String },
+    /// Accept a pending invitation for the given room (RoomState::Invited).
+    AcceptInvite { room_id: String },
+    /// Decline a pending invitation. The room is left and dropped from
+    /// the local rooms list on the next sync.
+    RejectInvite { room_id: String },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -885,6 +890,47 @@ async fn matrix_main(
                                 let _ = tx
                                     .send(Update::Error {
                                         reason: format!("/create : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::AcceptInvite { room_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match accept_invite(&c, &room_id).await {
+                            Ok(()) => {
+                                let _ = tx.send(snapshot_rooms(&c).await).await;
+                                let _ = load_room_messages(&c, &room_id, &tx).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/accept : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::RejectInvite { room_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match reject_invite(&c, &room_id).await {
+                            Ok(()) => {
+                                let _ = tx.send(snapshot_rooms(&c).await).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/reject : {e}"),
                                     })
                                     .await;
                             }
@@ -1952,12 +1998,14 @@ async fn snapshot_rooms(client: &Client) -> Update {
         let unread = counts.notification_count as usize;
         let mentions = counts.highlight_count as usize;
 
+        let invited = matches!(r.state(), RoomState::Invited);
         rooms.push(UiRoom {
             name,
             unread,
             mentions,
             pinned: false,
             muted: false,
+            invited,
         });
         ids.push(r.room_id().to_string());
     }
@@ -1976,12 +2024,13 @@ async fn load_room_messages(
         None => return Err("room introuvable".into()),
     };
 
-    // If the room is an open invite, accept it before fetching messages.
-    // Otherwise the homeserver returns 403 (user not in room).
+    // Auto-joining invited rooms here would silently consent to any
+    // incoming invitation — a privacy / spam footgun. Surface the state
+    // instead and let the UI offer /accept or /reject.
     match room.state() {
         RoomState::Joined => {}
         RoomState::Invited => {
-            room.join().await?;
+            return Err("invitation en attente · /accept ou /reject".into());
         }
         RoomState::Left | RoomState::Knocked | RoomState::Banned => {
             return Err("room non accessible".into());
@@ -2347,6 +2396,33 @@ async fn create_room(
 
     let room = client.create_room(req).await?;
     Ok(name.map(|s| s.to_string()).unwrap_or_else(|| room.room_id().to_string()))
+}
+
+/// Accept a pending invitation. Idempotent: joining an already-joined
+/// room returns Ok silently.
+async fn accept_invite(
+    client: &Client,
+    room_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("invite introuvable")?;
+    if matches!(room.state(), RoomState::Joined) {
+        return Ok(());
+    }
+    room.join().await?;
+    Ok(())
+}
+
+/// Decline a pending invitation. Implemented as `leave`, which the spec
+/// allows for invited rooms and drops them from the local rooms list.
+async fn reject_invite(
+    client: &Client,
+    room_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let room = client.get_room(&parsed).ok_or("invite introuvable")?;
+    room.leave().await?;
+    Ok(())
 }
 
 /// Invite `user_id` to `room_id`. The local user must have at least the

@@ -12,6 +12,10 @@ pub struct Room {
     pub mentions: usize,
     pub pinned: bool,
     pub muted: bool,
+    /// True when the room is a pending invitation (RoomState::Invited).
+    /// Rendered with an `i` marker; opening one prompts for /accept or
+    /// /reject instead of loading the timeline.
+    pub invited: bool,
 }
 
 pub struct RoomListState {
@@ -102,7 +106,9 @@ pub fn render(
         .map(|room| {
             let pin = if room.pinned { '*' } else { ' ' };
             let mute = if room.muted { 'm' } else { ' ' };
-            let counts = if room.unread == 0 {
+            let counts = if room.invited {
+                " [invite]".to_string()
+            } else if room.unread == 0 {
                 String::new()
             } else if room.mentions > 0 {
                 format!(" [{}@{}]", room.unread, room.mentions)
@@ -112,7 +118,7 @@ pub fn render(
             let text = format!("  {}{} {}{}", pin, mute, room.name, counts);
             ListRow::new(text)
                 .cursor_col(NAME_COL)
-                .bold(room.unread > 0)
+                .bold(room.unread > 0 || room.invited)
                 .dim(room.muted)
         })
         .collect();
