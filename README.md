@@ -75,6 +75,7 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `R` (Shift+r) | Reaction picker |
 | `d` | Message details (reactions, event id, raw content) |
 | `D` (Shift+d) | Redact (delete) selected message |
+| `E` (Shift+e) | Edit selected message (own text only, `m.replace`) |
 | `v` / `V` | Play / stop voice note |
 | `Space` | Pause / resume the active voice note |
 | `Esc` | Stop the active voice note |
@@ -122,6 +123,7 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/spaces [server]` | Browse the public spaces directory of `server` (or local) |
 | `/leave`, `/part` | Leave the active room |
 | `/redact`, `/del` | Redact the selected message |
+| `/edit` | Edit the selected message (same as `E`) |
 | `/react <emoji>` | React to the selected message |
 | `/restore` | Restore E2EE keys from a recovery key |
 | `/setup`, `/enable-recovery` | Provision a fresh recovery key |

@@ -251,6 +251,9 @@ fn handle_conversation_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Char('q') => app.open_quit_confirm(),
         KeyCode::Char('d') => app.open_details(),
         KeyCode::Char('D') => app.open_redact_confirm(),
+        // `E` (Shift+e) = edit the selected message (own text only).
+        // Lowercase `e` is taken: it opens the message body in $EDITOR.
+        KeyCode::Char('E') => app.start_edit(),
         // `r` = reply to selected message. `R` (Shift+r) = reaction picker.
         // The "who reacted" view is reachable from the details popup (`d`).
         KeyCode::Char('r') => app.start_reply(),

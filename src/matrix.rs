@@ -109,6 +109,14 @@ pub enum Command {
     RedactEvent { room_id: String, event_id: String },
     /// Send an `m.emote` (the IRC `/me` action).
     SendEmote { room_id: String, body: String },
+    /// Edit a previously-sent text message (`m.replace`). Only valid for
+    /// events whose original sender is the current user; the homeserver
+    /// will reject otherwise.
+    EditMessage {
+        room_id: String,
+        event_id: String,
+        body: String,
+    },
     /// Join a room by alias (`#name:server`) or id. `via` are server
     /// hints needed to federated-join a remote room by id; safe to pass
     /// empty when the target is an alias or already known locally.
@@ -801,6 +809,27 @@ async fn matrix_main(
                                     reason: format!("envoi /me : {e}"),
                                 })
                                 .await;
+                        }
+                    });
+                }
+            }
+            Command::EditMessage { room_id, event_id, body } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match do_edit(&c, &room_id, &event_id, &body).await {
+                            Ok(()) => {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                let _ = load_room_messages(&c, &room_id, &tx).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("édition : {e}"),
+                                    })
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -1705,14 +1734,30 @@ async fn run_sync(
 ) {
     // Live messages.
     let tx_handler = tx.clone();
+    let client_handler = client.clone();
     client.add_event_handler(
         move |ev: SyncRoomMessageEvent, room: matrix_sdk::room::Room| {
             let tx = tx_handler.clone();
+            let c = client_handler.clone();
             async move {
                 let original = match ev.as_original() {
                     Some(o) => o,
                     None => return, // redaction
                 };
+                // Edits (`m.replace`) and thread replies require the whole
+                // room timeline to be re-rendered: an edit overwrites a
+                // previous message's blocks, a thread reply attaches under
+                // its root. Reload the room instead of pushing a new line.
+                if matches!(
+                    &original.content.relates_to,
+                    Some(matrix_sdk::ruma::events::room::message::Relation::Replacement(_))
+                ) || matches!(
+                    &original.content.relates_to,
+                    Some(matrix_sdk::ruma::events::room::message::Relation::Thread(_))
+                ) {
+                    let _ = load_room_messages(&c, &room.room_id().to_string(), &tx).await;
+                    return;
+                }
                 let msg = event_content_to_message(
                     &original.event_id.to_string(),
                     &original.sender.to_string(),
@@ -1914,7 +1959,8 @@ async fn load_room_messages(
         .collect();
 
     // Pass 1: extract top-level RoomMessages and undecryptable placeholders.
-    // Skip thread replies, they are attached to their root in pass 2.
+    // Skip thread replies (attached to their root in pass 2) and edits
+    // (`m.replace`, applied in pass 3).
     let mut out: Vec<Message> = Vec::new();
     let mut idx_by_event: HashMap<String, usize> = HashMap::new();
 
@@ -1928,6 +1974,12 @@ async fn load_room_messages(
                     if matches!(
                         &rmc.relates_to,
                         Some(matrix_sdk::ruma::events::room::message::Relation::Thread(_))
+                    ) {
+                        continue;
+                    }
+                    if matches!(
+                        &rmc.relates_to,
+                        Some(matrix_sdk::ruma::events::room::message::Relation::Replacement(_))
                     ) {
                         continue;
                     }
@@ -2010,6 +2062,52 @@ async fn load_room_messages(
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    // Pass 3: apply edits (`m.replace`). For each target event, keep the
+    // latest replacement (by origin_server_ts) and overwrite the parent's
+    // blocks with the new content. Edits authored by anyone other than the
+    // original sender are dropped (servers usually filter, but be defensive).
+    {
+        use std::collections::HashMap as Map;
+        // (parent_event_id) -> (latest_ts, new_msgtype)
+        let mut latest: Map<String, (u64, MessageType)> = Map::new();
+        for raw in &events {
+            if let AnySyncTimelineEvent::MessageLike(ml) = raw {
+                let sender = ml.sender().to_string();
+                let ts: u64 = ml.origin_server_ts().0.into();
+                if let Some(AnyMessageLikeEventContent::RoomMessage(rmc)) =
+                    ml.original_content()
+                {
+                    if let Some(matrix_sdk::ruma::events::room::message::Relation::Replacement(
+                        r,
+                    )) = &rmc.relates_to
+                    {
+                        let parent = r.event_id.to_string();
+                        if let Some(&idx) = idx_by_event.get(&parent) {
+                            // Author check: short_author equality is enough
+                            // here since both come from the same MXID space.
+                            let parent_author = &out[idx].author;
+                            if short_author(&sender) != *parent_author {
+                                continue;
+                            }
+                            let new_msgtype = r.new_content.msgtype.clone();
+                            match latest.get(&parent) {
+                                Some((prev_ts, _)) if *prev_ts >= ts => {}
+                                _ => {
+                                    latest.insert(parent, (ts, new_msgtype));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (parent, (_ts, mt)) in latest {
+            if let Some(&idx) = idx_by_event.get(&parent) {
+                out[idx].blocks = msgtype_to_blocks(&mt);
             }
         }
     }
@@ -2358,6 +2456,37 @@ async fn do_send(
             in_reply_to: InReplyTo::new(event_id),
         });
     }
+    room.send(content).await?;
+    Ok(())
+}
+
+/// Send an edit (`m.replace`) for a previously-sent text message. The
+/// homeserver enforces that only the original sender can edit.
+async fn do_edit(
+    client: &Client,
+    room_id: &str,
+    event_id: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::events::relation::Replacement;
+    use matrix_sdk::ruma::events::room::message::{
+        Relation, RoomMessageEventContentWithoutRelation,
+    };
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let room = client
+        .get_room(&parsed_room)
+        .ok_or("room introuvable pour edit")?;
+    let parsed_event: OwnedEventId = event_id.parse()?;
+
+    // Fallback body shown by legacy clients that ignore m.new_content,
+    // per spec: prefix with "* ".
+    let mut content = RoomMessageEventContent::text_plain(format!("* {body}"));
+    let new_content: RoomMessageEventContentWithoutRelation =
+        RoomMessageEventContent::text_plain(body).into();
+    content.relates_to = Some(Relation::Replacement(Replacement::new(
+        parsed_event,
+        new_content,
+    )));
     room.send(content).await?;
     Ok(())
 }

@@ -116,6 +116,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "part",
     "redact",
     "del",
+    "edit",
     "react",
     "restore",
     "recovery",
@@ -243,6 +244,10 @@ pub struct App {
     /// Event id of the thread root the next outgoing message attaches to
     /// (`m.thread`). Takes precedence over a bare reply.
     pub thread_root: Option<String>,
+    /// Event id of the message currently being edited (`m.replace`). When
+    /// set, the next send dispatches `Command::EditMessage` instead of a
+    /// new message. Cleared on send and on Esc from the input bar.
+    pub editing_event_id: Option<String>,
     /// Voice note that is currently being played (or paused). Refreshed
     /// each tick from the audio thread.
     pub voice_playing: Option<VoicePlayback>,
@@ -300,6 +305,7 @@ impl App {
             pending_reopen_active: 0,
             reply_to: None,
             thread_root: None,
+            editing_event_id: None,
             voice_playing: None,
             pending_open_after_join: None,
         };
@@ -1611,6 +1617,19 @@ impl App {
             return;
         }
         if let (Some(id), Some(b)) = (self.current_room_id.clone(), self.matrix.as_ref()) {
+            // Edit path: replace the target event in place, keep the cursor
+            // on it. Reply/thread targets are ignored in edit mode.
+            if let Some(target) = self.editing_event_id.clone() {
+                b.send(MxCommand::EditMessage {
+                    room_id: id,
+                    event_id: target.clone(),
+                    body,
+                });
+                self.focus_event_id(&target, false);
+                self.set_focus(Focus::Conversation);
+                self.clear_compose_target();
+                return;
+            }
             let reply_to = self.reply_to.clone();
             let thread_root = self.thread_root.clone();
             b.send(MxCommand::SendMessage {
@@ -1682,7 +1701,80 @@ impl App {
     pub fn clear_compose_target(&mut self) {
         self.reply_to = None;
         self.thread_root = None;
+        self.editing_event_id = None;
         self.input_mode = InputMode::Normal;
+    }
+
+    /// Pre-fill the input bar with the body of the selected message and
+    /// mark the next send as an edit (`m.replace`). The message must have
+    /// been authored by the local user, and must be a plain text message
+    /// (voice notes, code blocks, etc. are not editable from the TUI).
+    pub fn start_edit(&mut self) {
+        let item = match self.current_item() {
+            Some(it) => it,
+            None => {
+                self.flash = Some("aucun message sélectionné".into());
+                return;
+            }
+        };
+        let (author, event_id, blocks) = match item.kind {
+            ItemKind::Top => {
+                let m = match self.messages.get(item.msg_idx) {
+                    Some(m) => m,
+                    None => return,
+                };
+                (m.author.clone(), m.event_id.clone(), &m.blocks)
+            }
+            ItemKind::Reply => {
+                let m = match self.messages.get(item.msg_idx) {
+                    Some(m) => m,
+                    None => return,
+                };
+                let r = match m.replies.get(item.reply_idx) {
+                    Some(r) => r,
+                    None => return,
+                };
+                (r.author.clone(), r.event_id.clone(), &r.blocks)
+            }
+        };
+        if event_id.is_empty() {
+            self.flash = Some("événement sans id, édition impossible".into());
+            return;
+        }
+        let me_short = self
+            .me
+            .trim_start_matches('@')
+            .split(':')
+            .next()
+            .unwrap_or(&self.me);
+        if author != me_short && author != self.me {
+            self.flash = Some("édition réservée à tes propres messages".into());
+            return;
+        }
+        // Concatenate Text blocks into a single editable body. Refuse on
+        // anything else (voice / code) to avoid lossy round-trips.
+        let mut body = String::new();
+        for b in blocks {
+            match b {
+                Block::Text(t) => {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(t);
+                }
+                Block::Code(_) | Block::Voice { .. } => {
+                    self.flash =
+                        Some("édition non supportée sur ce type de message".into());
+                    return;
+                }
+            }
+        }
+        self.editing_event_id = Some(event_id);
+        self.reply_to = None;
+        self.thread_root = None;
+        self.input_mode = InputMode::Edit;
+        self.input_set(body);
+        self.set_focus(Focus::Input);
     }
 
     /// Mark the message under the cursor as the target of the next sent
@@ -1826,6 +1918,7 @@ impl App {
                 }
             }
             "redact" | "del" => self.open_redact_confirm(),
+            "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
             "setup" | "enable-recovery" => self.enable_recovery(),
             "logout" => self.open_logout_confirm(),
@@ -2020,6 +2113,7 @@ impl App {
             "/join <#room:server>   rejoindre une room".into(),
             "/leave, /part          quitter la room courante".into(),
             "/redact, /del          supprimer le message courant".into(),
+            "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),
             "/setup                 générer la clé E2EE (1re fois sur ce compte)".into(),
             "/restore, /recovery    importer une clé de récupération E2EE".into(),
