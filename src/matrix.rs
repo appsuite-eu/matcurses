@@ -354,12 +354,25 @@ pub struct MatrixBridge {
 
 impl MatrixBridge {
     pub fn spawn() -> std::io::Result<Self> {
+        // Default worker threads (num_cpus): the previous cap of 2 made
+        // every parallel-looking spawn queue up on two cores. Heavy ops
+        // like load_spaces (federated hierarchy crawl) and snapshot_rooms
+        // benefit from real parallelism; nothing else costs us by using
+        // them. We keep at least 4 even on 1-core boxes to avoid wedging
+        // when one task is awaiting I/O.
+        let cpu_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(cpu_threads)
             .build()?;
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
-        let (update_tx, update_rx) = mpsc::channel::<Update>(64);
+        // The command channel is just a dispatch queue; bumping the bound
+        // smoothes bursts (room list + spaces + members + voice all firing
+        // around the same screen) without changing flow control.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(128);
+        let (update_tx, update_rx) = mpsc::channel::<Update>(256);
 
         // Dedicated audio thread (rodio's OutputStream is !Send so it must
         // live on a single thread that owns it).
@@ -729,7 +742,7 @@ async fn matrix_main(
             }
             Command::RefreshRooms => {
                 if let Some(c) = &client {
-                    let _ = update_tx.send(snapshot_rooms(c).await).await;
+                    let _ = update_tx.send(snapshot_rooms(c)).await;
                 }
             }
             Command::LoadMembers { room_id } => {
@@ -1206,7 +1219,7 @@ async fn matrix_main(
                     tokio::spawn(async move {
                         match accept_invite(&c, &room_id).await {
                             Ok(()) => {
-                                let _ = tx.send(snapshot_rooms(&c).await).await;
+                                let _ = tx.send(snapshot_rooms(&c)).await;
                                 let _ = load_room_messages(&c, &room_id, &tx).await;
                             }
                             Err(e) => {
@@ -1227,7 +1240,7 @@ async fn matrix_main(
                     tokio::spawn(async move {
                         match reject_invite(&c, &room_id).await {
                             Ok(()) => {
-                                let _ = tx.send(snapshot_rooms(&c).await).await;
+                                let _ = tx.send(snapshot_rooms(&c)).await;
                             }
                             Err(e) => {
                                 let _ = tx
@@ -1800,19 +1813,20 @@ async fn collect_space_children(
     // not joined. We ask for several levels at once so unjoined
     // sub-spaces also come back populated; otherwise pressing Right on
     // them would land on an empty children vec.
-    // Paginate the hierarchy endpoint so we collect every direct + grand-
-    // child of the space, not just the first 100 entries the server feels
-    // like sending. With `max_depth=2` we cover sub-space → its rooms,
-    // which is what the user actually wants to expand. Cap the total
-    // chunks at something sane in case a homeserver returns ridiculous
-    // numbers of descendants (Matrix.org Community sits around 600).
+    // Paginate the hierarchy endpoint at `max_depth=1` so we collect
+    // direct children only. Deeper levels are loaded lazily through
+    // `Command::LoadSpaceChildren` when the user actually expands a
+    // sub-space. The previous `max_depth=2` could trigger a chain of
+    // federated calls per top-level space — fine for a small home
+    // server, painful for matrix.org-anchored accounts. Cap the total
+    // chunks so a misbehaving server can't make us spin forever.
     const HIERARCHY_HARD_CAP: usize = 1500;
     let mut chunks: HashMap<OwnedRoomId, SpaceHierarchyRoomsChunk> = HashMap::new();
     let mut from: Option<String> = None;
     loop {
         let mut request = get_hierarchy::v1::Request::new(space.room_id().to_owned());
         request.limit = Some(100u32.into());
-        request.max_depth = Some(2u32.into());
+        request.max_depth = Some(1u32.into());
         request.from = from.clone();
         let response = match client.send(request).await {
             Ok(r) => r,
@@ -2227,10 +2241,21 @@ async fn run_sync(
     );
 
     // Surface the cached rooms (restored from the SQLite store by
-    // `restore_session`) immediately. Otherwise the UI sees zero rooms
-    // until the initial network sync returns — which on a delta sync with
-    // an outdated next_batch token can take the full 30 s timeout.
-    let _ = tx.send(snapshot_rooms(&client).await).await;
+    // `restore_session`) immediately, then kick off a background warm-up
+    // that computes any missing display names in parallel and re-emits a
+    // fresh snapshot when at least one landed. The first paint is
+    // synchronous and cheap; the names appear "later" but without ever
+    // blocking the dispatch loop.
+    let first = snapshot_rooms(&client);
+    let mut last_rooms_hash = hash_rooms_update(&first);
+    let _ = tx.send(first).await;
+    {
+        let c = client.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            warm_room_names(c, tx).await;
+        });
+    }
 
     // Premier sync pour peupler.
     let settings = SyncSettings::new().timeout(Duration::from_secs(30));
@@ -2242,7 +2267,12 @@ async fn run_sync(
             .await;
         return;
     }
-    let _ = tx.send(snapshot_rooms(&client).await).await;
+    let post_sync = snapshot_rooms(&client);
+    let h = hash_rooms_update(&post_sync);
+    if h != last_rooms_hash {
+        last_rooms_hash = h;
+        let _ = tx.send(post_sync).await;
+    }
     let _ = tx.send(Update::SyncComplete).await;
 
     // Kick off an eager spaces load right after the initial sync lands.
@@ -2265,36 +2295,67 @@ async fn run_sync(
         });
     }
 
-    // Continuous sync: push a rooms snapshot after each iteration so the UI
-    // reflects new rooms in real time (including those created by bridges
-    // like mautrix-whatsapp), unread count changes, name changes, etc.
+    // Continuous sync: push a rooms snapshot after each iteration ONLY
+    // when something visible (name / unread / mention / invited / set of
+    // rooms) actually changed. Previously we emitted on every iteration,
+    // which the UI then sorted + re-rendered for nothing. The hash is
+    // cheap (a single u64 from a fixed projection).
     let tx_cb = tx.clone();
     let client_cb = client.clone();
     let cur_cb = current_room.clone();
-    // Tracks the set of space room ids we've already crawled. If the
-    // sync iteration changes it (new space joined, space removed), we
-    // re-run load_spaces in the background so F3 stays current without
-    // user intervention.
+    let last_rooms_hash = Arc::new(tokio::sync::Mutex::new(last_rooms_hash));
     let last_space_ids: Arc<tokio::sync::Mutex<std::collections::BTreeSet<OwnedRoomId>>> =
         Arc::new(tokio::sync::Mutex::new(current_space_ids(&client)));
+    // Debounce the active-room safety reload: the SyncRoomMessageEvent
+    // handler already pushes NewMessage live for the common case. We
+    // only call load_room_messages here as a backstop for delayed
+    // decryption, so once per second is plenty.
+    let last_active_reload: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     let result = client
         .sync_with_callback(settings, move |response| {
             let tx = tx_cb.clone();
             let c = client_cb.clone();
             let cur = cur_cb.clone();
             let last_space_ids = last_space_ids.clone();
+            let last_rooms_hash = last_rooms_hash.clone();
+            let last_active_reload = last_active_reload.clone();
             async move {
-                let _ = tx.send(snapshot_rooms(&c).await).await;
+                let snap = snapshot_rooms(&c);
+                let h = hash_rooms_update(&snap);
+                let mut guard = last_rooms_hash.lock().await;
+                if *guard != h {
+                    *guard = h;
+                    drop(guard);
+                    let _ = tx.send(snap).await;
+                }
                 // Safety net for the live SyncRoomMessageEvent handler:
                 // if the active room received any timeline events this
-                // iteration, force a refetch. Catches messages that the
-                // SDK could not yet decrypt at handler time, or that the
-                // bridge re-encrypted asynchronously.
+                // iteration, force a refetch — but debounced. Without
+                // the debounce a noisy room hammers /messages once per
+                // 30 s sync window AND once per event handler firing,
+                // which stacked badly on slow links.
                 let cur_id = cur.lock().await.clone();
                 if let Some(rid) = cur_id {
                     if let Some(joined) = response.rooms.joined.get(&rid) {
                         if !joined.timeline.events.is_empty() {
-                            let _ = load_room_messages(&c, &rid.to_string(), &tx).await;
+                            let now = std::time::Instant::now();
+                            let mut last = last_active_reload.lock().await;
+                            let should = match *last {
+                                Some(t) => now.duration_since(t)
+                                    >= Duration::from_millis(800),
+                                None => true,
+                            };
+                            if should {
+                                *last = Some(now);
+                                drop(last);
+                                let _ = load_room_messages(
+                                    &c,
+                                    &rid.to_string(),
+                                    &tx,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -2325,6 +2386,27 @@ async fn run_sync(
     }
 }
 
+/// Fold a Rooms update into a single u64 so the continuous-sync
+/// callback can decide whether to emit at all. We hash the bits the
+/// list view cares about (name, unread, mentions, invited, id, position)
+/// — not the whole Update — so cosmetic-only changes still get through.
+fn hash_rooms_update(u: &Update) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    if let Update::Rooms { rooms, ids } = u {
+        rooms.len().hash(&mut h);
+        for (r, id) in rooms.iter().zip(ids.iter()) {
+            id.hash(&mut h);
+            r.name.hash(&mut h);
+            r.unread.hash(&mut h);
+            r.mentions.hash(&mut h);
+            r.invited.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 /// Cheap snapshot of "which spaces are we joined to right now". Used
 /// by the continuous-sync callback to decide whether the F3 tree needs
 /// re-crawling. Walks `client.rooms()` (in-memory) without hitting
@@ -2338,34 +2420,69 @@ fn current_space_ids(client: &Client) -> std::collections::BTreeSet<OwnedRoomId>
         .collect()
 }
 
-/// Synchronous rooms snapshot (run on the tokio side).
-async fn snapshot_rooms(client: &Client) -> Update {
-    let mut rooms = Vec::new();
-    let mut ids = Vec::new();
-    for r in client.rooms() {
-        let name = match r.display_name().await {
-            Ok(n) => n.to_string(),
-            Err(_) => r
-                .name()
-                .unwrap_or_else(|| r.room_id().to_string()),
-        };
-
+/// Build a rooms snapshot **without awaiting per room**. The previous
+/// implementation called `display_name().await` for every room on every
+/// sync iteration; with a couple of hundred rooms that meant a few
+/// hundred awaits sequencing on the runtime's worker pool — visibly slow
+/// at startup. We use `cached_display_name()` (returns instantly from
+/// the local store) and fall back to `name()` / the room id. A separate
+/// background task (`warm_room_names`) populates the cache for rooms
+/// that don't have it yet, so subsequent snapshots get the real names.
+fn snapshot_rooms(client: &Client) -> Update {
+    let all = client.rooms();
+    let mut rooms = Vec::with_capacity(all.len());
+    let mut ids = Vec::with_capacity(all.len());
+    for r in &all {
+        let name = r
+            .cached_display_name()
+            .map(|n| n.to_string())
+            .or_else(|| r.name())
+            .unwrap_or_else(|| r.room_id().to_string());
         let counts = r.unread_notification_counts();
-        let unread = counts.notification_count as usize;
-        let mentions = counts.highlight_count as usize;
-
-        let invited = matches!(r.state(), RoomState::Invited);
         rooms.push(UiRoom {
             name,
-            unread,
-            mentions,
+            unread: counts.notification_count as usize,
+            mentions: counts.highlight_count as usize,
             pinned: false,
             muted: false,
-            invited,
+            invited: matches!(r.state(), RoomState::Invited),
         });
         ids.push(r.room_id().to_string());
     }
     Update::Rooms { rooms, ids }
+}
+
+/// Best-effort: walk every room whose computed display name is not yet
+/// cached, call `display_name()` (which the SDK uses to compute + cache),
+/// and emit a fresh snapshot when at least one name landed. Runs on the
+/// tokio runtime; awaits are concurrent via `FuturesUnordered` so a slow
+/// per-room call can't stall the others.
+async fn warm_room_names(client: Arc<Client>, tx: Sender<Update>) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    let pending: Vec<_> = client
+        .rooms()
+        .into_iter()
+        .filter(|r| r.cached_display_name().is_none())
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let mut tasks = FuturesUnordered::new();
+    for r in pending {
+        tasks.push(async move {
+            // The result is discarded — the side effect (cache population)
+            // is what we want. Errors are non-fatal: snapshot_rooms_sync
+            // falls back to the room's name / id.
+            let _ = r.display_name().await;
+        });
+    }
+    let mut warmed = 0usize;
+    while tasks.next().await.is_some() {
+        warmed += 1;
+    }
+    if warmed > 0 {
+        let _ = tx.send(snapshot_rooms(&client)).await;
+    }
 }
 
 /// Load the ~50 latest messages of a room and emit an `Update::RoomMessages`.

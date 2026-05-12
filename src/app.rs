@@ -407,8 +407,11 @@ impl App {
                 self.search.timeout - elapsed
             }
         } else if self.matrix.is_some() {
-            // Regular polling to fetch Matrix updates without blocking too long.
-            Duration::from_millis(150)
+            // Background updates land on an mpsc channel; we drain them
+            // each tick. Tighter polling shaves the perceived "lag"
+            // between a sync emission and the UI repaint without costing
+            // anything noticeable (the poll loop is a few syscalls).
+            Duration::from_millis(30)
         } else {
             Duration::from_secs(60)
         }
