@@ -9,12 +9,26 @@ use widgets::{render_tree, ListState, TreeRow, TreeRowKind};
 #[derive(Clone)]
 pub enum NodeKind {
     Space {
+        /// Stable identifier (Matrix room id) so the app can target this
+        /// space when grafting lazy-loaded children back into the tree.
+        room_id: String,
         children: Vec<Node>,
         expanded: bool,
+        /// `true` once this space's children have been populated from a
+        /// hierarchy response. Spaces beyond the initial fetch depth land
+        /// here as leaves with `loaded = false`; expanding them triggers
+        /// a fresh hierarchy call rooted at this space.
+        loaded: bool,
+        /// `via` server hints from the parent's `m.space.child` event.
+        /// Required to federated-join a room by id (no alias) — without
+        /// these the homeserver returns "no servers that are in the
+        /// room have been provided".
+        via: Vec<String>,
     },
     Room {
         name: String,
         unread: usize,
+        via: Vec<String>,
     },
 }
 
@@ -100,13 +114,29 @@ impl SpaceTreeState {
             None => return Action::None,
         };
         match &mut node.kind {
-            NodeKind::Space { expanded, .. } => {
+            NodeKind::Space {
+                expanded,
+                loaded,
+                room_id,
+                via,
+                ..
+            } => {
                 if !*expanded {
                     *expanded = true;
                 }
-                Action::None
+                if !*loaded {
+                    let _ = via;
+                    Action::LoadChildren {
+                        room_id: room_id.clone(),
+                    }
+                } else {
+                    Action::None
+                }
             }
-            NodeKind::Room { name, .. } => Action::OpenRoom(name.clone()),
+            NodeKind::Room { name, via, .. } => Action::OpenRoom {
+                room_id: name.clone(),
+                via: via.clone(),
+            },
         }
     }
 
@@ -158,7 +188,11 @@ pub enum KindRepr {
 
 pub enum Action {
     None,
-    OpenRoom(String),
+    OpenRoom {
+        room_id: String,
+        via: Vec<String>,
+    },
+    LoadChildren { room_id: String },
 }
 
 fn collect_flat(node: &Node, path: &[usize], depth: u16, out: &mut Vec<FlatItem>) {
@@ -183,6 +217,7 @@ fn collect_flat(node: &Node, path: &[usize], depth: u16, out: &mut Vec<FlatItem>
     if let NodeKind::Space {
         children,
         expanded: true,
+        ..
     } = &node.kind
     {
         for (i, child) in children.iter().enumerate() {
@@ -212,7 +247,7 @@ fn expand_along(roots: &mut [Node], path: &[usize]) {
         Some(n) => n,
         None => return,
     };
-    if let NodeKind::Space { expanded, children } = &mut node.kind {
+    if let NodeKind::Space { expanded, children, .. } = &mut node.kind {
         *expanded = true;
         if path.len() > 1 {
             expand_along(children, &path[1..]);

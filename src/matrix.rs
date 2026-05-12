@@ -82,6 +82,9 @@ pub enum Command {
     LoadMembers { room_id: String },
     /// Load the spaces tree (top-level + their children).
     LoadSpaces,
+    /// Lazy-load the children of a single space (the user expanded a
+    /// node whose subtree was not in the initial hierarchy fetch).
+    LoadSpaceChildren { room_id: String },
     /// Try to restore a previous session from the SQLite store.
     /// On success → Update::LoggedIn + continuous sync. Otherwise → silence.
     TryRestore,
@@ -106,8 +109,13 @@ pub enum Command {
     RedactEvent { room_id: String, event_id: String },
     /// Send an `m.emote` (the IRC `/me` action).
     SendEmote { room_id: String, body: String },
-    /// Join a room by alias (`#name:server`) or id.
-    JoinRoom { alias_or_id: String },
+    /// Join a room by alias (`#name:server`) or id. `via` are server
+    /// hints needed to federated-join a remote room by id; safe to pass
+    /// empty when the target is an alias or already known locally.
+    JoinRoom {
+        alias_or_id: String,
+        via: Vec<String>,
+    },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -172,6 +180,13 @@ pub enum Update {
     },
     /// Spaces tree (in response to LoadSpaces).
     Spaces { roots: Vec<UiNode> },
+    /// Children of a single space, in response to `LoadSpaceChildren`.
+    /// `parent_id` is the room id the user expanded; `children` are the
+    /// nodes to splice in place of its current (empty) children list.
+    SpaceChildren {
+        parent_id: String,
+        children: Vec<UiNode>,
+    },
     /// Result of a `DiscoverPublicRooms` query.
     PublicRooms {
         server: String,
@@ -812,12 +827,12 @@ async fn matrix_main(
                     });
                 }
             }
-            Command::JoinRoom { alias_or_id } => {
+            Command::JoinRoom { alias_or_id, via } => {
                 if let Some(c) = &client {
                     let tx = update_tx.clone();
                     let c = c.clone();
                     tokio::spawn(async move {
-                        match join_room(&c, &alias_or_id).await {
+                        match join_room(&c, &alias_or_id, &via).await {
                             Ok(name) => {
                                 let _ = tx
                                     .send(Update::Error {
@@ -999,8 +1014,93 @@ async fn matrix_main(
                     });
                 }
             }
+            Command::LoadSpaceChildren { room_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match load_space_children_for(&c, &room_id).await {
+                            Ok(children) => {
+                                let _ = tx
+                                    .send(Update::SpaceChildren {
+                                        parent_id: room_id,
+                                        children,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("spaces (lazy) : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
         }
     }
+}
+
+/// Lazy-load children for a single space (the user expanded a node we
+/// hadn't fetched at initial-tree time). Same hierarchy + pagination as
+/// the bulk load, rooted at `room_id`.
+async fn load_space_children_for(
+    client: &Client,
+    room_id: &str,
+) -> Result<Vec<UiNode>, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: OwnedRoomId = room_id.parse()?;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(parsed.to_string());
+    // Build a fake `Room`-like context isn't necessary — we only need the
+    // hierarchy fetch. Reuse `collect_space_children` by fetching the
+    // SDK's local Room when available; otherwise drive the hierarchy
+    // call directly.
+    if let Some(local) = client.get_room(&parsed) {
+        Ok(collect_space_children(client, &local, &mut visited).await)
+    } else {
+        Ok(collect_space_children_unjoined(client, &parsed, &mut visited).await)
+    }
+}
+
+/// Fallback `collect_space_children` for a space the SDK doesn't have a
+/// local Room for (typically because the user hasn't joined it yet).
+/// Drives the hierarchy endpoint directly off the room id.
+async fn collect_space_children_unjoined(
+    client: &Client,
+    room_id: &OwnedRoomId,
+    visited: &mut std::collections::HashSet<String>,
+) -> Vec<UiNode> {
+    use matrix_sdk::ruma::api::client::space::get_hierarchy;
+    use matrix_sdk::ruma::api::client::space::SpaceHierarchyRoomsChunk;
+    use std::collections::HashMap;
+
+    const HIERARCHY_HARD_CAP: usize = 1500;
+    let mut chunks: HashMap<OwnedRoomId, SpaceHierarchyRoomsChunk> = HashMap::new();
+    let mut from: Option<String> = None;
+    loop {
+        let mut request = get_hierarchy::v1::Request::new(room_id.clone());
+        request.limit = Some(100u32.into());
+        request.max_depth = Some(2u32.into());
+        request.from = from.clone();
+        let response = match client.send(request).await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let next = response.next_batch.clone();
+        for c in response.rooms {
+            chunks.insert(c.summary.room_id.clone(), c);
+        }
+        if next.is_none() || chunks.len() >= HIERARCHY_HARD_CAP {
+            break;
+        }
+        from = next;
+    }
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    build_children_from_hierarchy(client, &chunks, room_id, visited).await
 }
 
 /// Try to restore a previously persisted session from the SQLite store.
@@ -1240,8 +1340,13 @@ async fn build_space_node(
     UiNode {
         label,
         kind: UiNodeKind::Space {
+            room_id: space.room_id().to_string(),
             expanded: false,
             children,
+            loaded: true,
+            // Top-level (joined) spaces don't need via hints to be
+            // re-joined; they're already in the user's local state.
+            via: Vec::new(),
         },
     }
 }
@@ -1252,105 +1357,150 @@ async fn collect_space_children(
     visited: &mut std::collections::HashSet<String>,
 ) -> Vec<UiNode> {
     use matrix_sdk::ruma::api::client::space::get_hierarchy;
-    use matrix_sdk::ruma::room::RoomType;
+    use matrix_sdk::ruma::api::client::space::SpaceHierarchyRoomsChunk;
     use std::collections::HashMap;
 
     // The space hierarchy endpoint (`GET /rooms/{id}/hierarchy`, MSC2946 /
     // spec 1.2) returns RoomSummary chunks for the space and all
     // descendants the homeserver knows about — even ones the user has
-    // not joined. The previous implementation walked m.space.child state
-    // events and dropped any child where `client.get_room()` returned
-    // None, which made every public space look empty.
-    let mut request = get_hierarchy::v1::Request::new(space.room_id().to_owned());
-    request.limit = Some(100u32.into());
-    request.max_depth = Some(1u32.into());
-    let response = match client.send(request).await {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    // First chunk is the queried space itself; subsequent chunks are its
-    // direct children at depth 1.
-    let mut iter = response.rooms.into_iter();
-    let space_chunk = match iter.next() {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-    let summaries: HashMap<OwnedRoomId, _> =
-        iter.map(|c| (c.summary.room_id.clone(), c.summary)).collect();
-
-    let mut out = Vec::new();
-    for raw in space_chunk.children_state.iter() {
-        let parsed = match raw.deserialize() {
-            Ok(p) => p,
-            Err(_) => continue,
+    // not joined. We ask for several levels at once so unjoined
+    // sub-spaces also come back populated; otherwise pressing Right on
+    // them would land on an empty children vec.
+    // Paginate the hierarchy endpoint so we collect every direct + grand-
+    // child of the space, not just the first 100 entries the server feels
+    // like sending. With `max_depth=2` we cover sub-space → its rooms,
+    // which is what the user actually wants to expand. Cap the total
+    // chunks at something sane in case a homeserver returns ridiculous
+    // numbers of descendants (Matrix.org Community sits around 600).
+    const HIERARCHY_HARD_CAP: usize = 1500;
+    let mut chunks: HashMap<OwnedRoomId, SpaceHierarchyRoomsChunk> = HashMap::new();
+    let mut from: Option<String> = None;
+    loop {
+        let mut request = get_hierarchy::v1::Request::new(space.room_id().to_owned());
+        request.limit = Some(100u32.into());
+        request.max_depth = Some(2u32.into());
+        request.from = from.clone();
+        let response = match client.send(request).await {
+            Ok(r) => r,
+            Err(_) => break,
         };
-        let child_id = parsed.state_key.clone();
-        let child_id_str = child_id.to_string();
-        if visited.contains(&child_id_str) {
-            continue;
+        let next = response.next_batch.clone();
+        for c in response.rooms {
+            chunks.insert(c.summary.room_id.clone(), c);
         }
-        let summary = summaries.get(&child_id);
+        if next.is_none() || chunks.len() >= HIERARCHY_HARD_CAP {
+            break;
+        }
+        from = next;
+    }
+    if chunks.is_empty() {
+        return Vec::new();
+    }
 
-        // Type (space vs room) and label come from local SDK state if we
-        // already know about the child, otherwise from the hierarchy
-        // summary, otherwise we fall back to the room id.
-        let local = client.get_room(&child_id);
-        let is_space = if let Some(r) = &local {
-            r.is_space()
-        } else if let Some(s) = summary {
-            matches!(s.room_type, Some(RoomType::Space))
-        } else {
-            false
-        };
-        let label = if let Some(r) = &local {
-            r.display_name()
-                .await
-                .map(|n| n.to_string())
-                .unwrap_or_else(|_| {
-                    summary
-                        .and_then(|s| s.name.clone())
-                        .unwrap_or_else(|| child_id_str.clone())
-                })
-        } else if let Some(s) = summary {
-            s.name.clone().unwrap_or_else(|| child_id_str.clone())
-        } else {
-            child_id_str.clone()
-        };
+    let root_id = space.room_id().to_owned();
+    build_children_from_hierarchy(client, &chunks, &root_id, visited).await
+}
 
-        if is_space {
-            if let Some(r) = local {
-                // Joined sub-space: recurse to get its own children.
-                let node = Box::pin(build_space_node(client, &r, visited)).await;
-                out.push(node);
+fn build_children_from_hierarchy<'a>(
+    client: &'a Client,
+    chunks: &'a std::collections::HashMap<
+        OwnedRoomId,
+        matrix_sdk::ruma::api::client::space::SpaceHierarchyRoomsChunk,
+    >,
+    parent: &'a OwnedRoomId,
+    visited: &'a mut std::collections::HashSet<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<UiNode>> + Send + 'a>> {
+    Box::pin(async move {
+        use matrix_sdk::ruma::room::RoomType;
+        let chunk = match chunks.get(parent) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for raw in &chunk.children_state {
+            let parsed = match raw.deserialize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let child_id = parsed.state_key.clone();
+            let child_id_str = child_id.to_string();
+            if visited.contains(&child_id_str) {
+                continue;
+            }
+            // The m.space.child event content carries `via` server hints
+            // — required to federate-join a child by id. Drop them and
+            // the join later fails with "no servers ... have been provided".
+            let via: Vec<String> = parsed
+                .content
+                .via
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let summary = chunks.get(&child_id).map(|c| &c.summary);
+            let local = client.get_room(&child_id);
+
+            let is_space = if let Some(r) = &local {
+                r.is_space()
+            } else if let Some(s) = summary {
+                matches!(s.room_type, Some(RoomType::Space))
             } else {
-                // Not joined yet: surface the sub-space as a leaf so the
-                // user can see it and join via /rooms or /join.
+                false
+            };
+            let label = if let Some(r) = &local {
+                r.display_name()
+                    .await
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| {
+                        summary
+                            .and_then(|s| s.name.clone())
+                            .unwrap_or_else(|| child_id_str.clone())
+                    })
+            } else if let Some(s) = summary {
+                s.name.clone().unwrap_or_else(|| child_id_str.clone())
+            } else {
+                child_id_str.clone()
+            };
+
+            if is_space {
                 visited.insert(child_id_str.clone());
+                // A child sub-space is "loaded" only if its own chunk
+                // came back in this hierarchy fetch — otherwise we know
+                // it's a space but not what's inside, and the UI marks
+                // it as needing a lazy fetch on expand.
+                let loaded = chunks.contains_key(&child_id);
+                let children = if loaded {
+                    build_children_from_hierarchy(client, chunks, &child_id, visited).await
+                } else {
+                    Vec::new()
+                };
                 out.push(UiNode {
                     label,
                     kind: UiNodeKind::Space {
+                        room_id: child_id_str.clone(),
                         expanded: false,
-                        children: Vec::new(),
+                        children,
+                        loaded,
+                        via: via.clone(),
+                    },
+                });
+            } else {
+                visited.insert(child_id_str.clone());
+                let unread = local
+                    .as_ref()
+                    .map(|r| r.unread_notification_counts().notification_count as usize)
+                    .unwrap_or(0);
+                out.push(UiNode {
+                    label,
+                    kind: UiNodeKind::Room {
+                        name: child_id_str,
+                        unread,
+                        via,
                     },
                 });
             }
-        } else {
-            visited.insert(child_id_str.clone());
-            let unread = local
-                .as_ref()
-                .map(|r| r.unread_notification_counts().notification_count as usize)
-                .unwrap_or(0);
-            out.push(UiNode {
-                label,
-                kind: UiNodeKind::Room {
-                    name: child_id_str,
-                    unread,
-                },
-            });
         }
-    }
-    out
+        out
+    })
 }
 
 /// Perform the login (and optional session restore), return a connected Client.
@@ -1973,10 +2123,17 @@ async fn discover_public_rooms(
 async fn join_room(
     client: &Client,
     alias_or_id: &str,
+    via: &[String],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use matrix_sdk::ruma::OwnedRoomOrAliasId;
+    use matrix_sdk::ruma::{OwnedRoomOrAliasId, OwnedServerName};
     let parsed: OwnedRoomOrAliasId = alias_or_id.parse()?;
-    let room = client.join_room_by_id_or_alias(&parsed, &[]).await?;
+    let via_parsed: Vec<OwnedServerName> = via
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let room = client
+        .join_room_by_id_or_alias(&parsed, &via_parsed)
+        .await?;
     // Right after a remote join, the room's state has not been synced yet,
     // so `display_name()` returns `RoomDisplayName::Empty` ("Empty Room").
     // Fall back to whatever the user typed so the flash is meaningful;

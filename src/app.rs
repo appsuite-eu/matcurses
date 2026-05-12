@@ -904,6 +904,7 @@ impl App {
         if let Some(b) = self.matrix.as_ref() {
             b.send(MxCommand::JoinRoom {
                 alias_or_id: target.clone(),
+                via: Vec::new(),
             });
             self.flash = Some(format!("rejoindre {target}…"));
         }
@@ -1160,7 +1161,7 @@ impl App {
     /// local rooms list, switch to it immediately. Otherwise fire a
     /// JoinRoom and remember the target so the next sync that surfaces
     /// it can auto-focus the new room.
-    pub fn open_room_or_join(&mut self, name_or_id: &str) {
+    pub fn open_room_or_join(&mut self, name_or_id: &str, via: Vec<String>) {
         let known = self
             .room_list_state
             .rooms
@@ -1174,6 +1175,7 @@ impl App {
         if let Some(b) = self.matrix.as_ref() {
             b.send(MxCommand::JoinRoom {
                 alias_or_id: name_or_id.to_string(),
+                via,
             });
             self.pending_open_after_join = Some(name_or_id.to_string());
             self.flash = Some(format!("rejoindre {name_or_id}…"));
@@ -1806,6 +1808,7 @@ impl App {
                 if let (true, Some(b)) = (self.matrix_logged_in, self.matrix.as_ref()) {
                     b.send(MxCommand::JoinRoom {
                         alias_or_id: args.to_string(),
+                    via: Vec::new(),
                     });
                 } else {
                     self.flash = Some("/join indisponible (hors session)".into());
@@ -2308,6 +2311,13 @@ impl App {
                     selected: 0,
                 }));
             }
+            MxUpdate::SpaceChildren { parent_id, children } => {
+                graft_space_children(
+                    &mut self.space_tree_state.roots,
+                    &parent_id,
+                    children,
+                );
+            }
             MxUpdate::Spaces { roots } => {
                 // Same defense as for `Rooms`: don't replace the tree with
                 // an empty result if we already had spaces. Happens when
@@ -2776,6 +2786,48 @@ fn reply_text(r: &crate::message::ThreadReply) -> String {
         }
     }
     s
+}
+
+/// Walk the spaces tree and replace the children of the Space node whose
+/// `room_id` matches `parent_id`. Marks it as `loaded = true` so the next
+/// expand doesn't fire another lazy fetch. Used to splice in the response
+/// of `Update::SpaceChildren`.
+fn graft_space_children(
+    nodes: &mut [crate::view::space_tree::Node],
+    parent_id: &str,
+    new_children: Vec<crate::view::space_tree::Node>,
+) {
+    if let Some(target) = find_space_mut(nodes, parent_id) {
+        if let crate::view::space_tree::NodeKind::Space {
+            children, loaded, ..
+        } = &mut target.kind
+        {
+            *children = new_children;
+            *loaded = true;
+        }
+    }
+}
+
+fn find_space_mut<'a>(
+    nodes: &'a mut [crate::view::space_tree::Node],
+    target_id: &str,
+) -> Option<&'a mut crate::view::space_tree::Node> {
+    use crate::view::space_tree::NodeKind;
+    for node in nodes.iter_mut() {
+        let matched = matches!(
+            &node.kind,
+            NodeKind::Space { room_id, .. } if room_id == target_id
+        );
+        if matched {
+            return Some(node);
+        }
+        if let NodeKind::Space { children, .. } = &mut node.kind {
+            if let Some(found) = find_space_mut(children, target_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn collect_expanded_labels(

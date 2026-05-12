@@ -349,16 +349,19 @@ fn handle_space_tree_key(app: &mut App, key: KeyEvent) -> EventOutcome {
         KeyCode::Right | KeyCode::Char('+') | KeyCode::Enter
     ) {
         match app.space_tree_state.open() {
-            Action::OpenRoom(name) => app.open_room_or_join(&name),
-            Action::None => {
-                // The user expanded a space. Trigger a LoadSpaces refresh so
-                // children populated by recent sync iterations show up.
+            Action::OpenRoom { room_id, via } => {
+                app.open_room_or_join(&room_id, via);
+            }
+            Action::LoadChildren { room_id } => {
                 if app.matrix_logged_in {
                     if let Some(b) = &app.matrix {
-                        b.send(crate::matrix::Command::LoadSpaces);
+                        b.send(crate::matrix::Command::LoadSpaceChildren {
+                            room_id,
+                        });
                     }
                 }
             }
+            Action::None => {}
         }
         return EventOutcome::Continue;
     }
