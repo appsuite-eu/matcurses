@@ -122,6 +122,9 @@ Settings live at `~/.config/matcurses/settings.toml` (or the platform-equivalent
 | `/rooms [server]`, `/discover [server]` | Browse the public room directory of `server` (or local) |
 | `/spaces [server]` | Browse the public spaces directory of `server` (or local) |
 | `/leave`, `/part` | Leave the active room |
+| `/create [name]` | Create a new private room |
+| `/dm @user:server` | Open a 1:1 DM with `@user` |
+| `/invite @user:server` | Invite `@user` into the active room |
 | `/redact`, `/del` | Redact the selected message |
 | `/edit` | Edit the selected message (same as `E`) |
 | `/react <emoji>` | React to the selected message |

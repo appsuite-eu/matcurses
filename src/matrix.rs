@@ -124,6 +124,18 @@ pub enum Command {
         alias_or_id: String,
         via: Vec<String>,
     },
+    /// Create a new room. When `is_direct` is true the homeserver flags
+    /// the room as a 1:1 DM and tracks it in `m.direct`. `invite` is the
+    /// initial list of MXIDs to invite (typically the DM partner for the
+    /// DM case, may be empty for a regular `/create`).
+    CreateRoom {
+        name: Option<String>,
+        is_direct: bool,
+        invite: Vec<String>,
+    },
+    /// Invite a user to the given room. Requires the local user to have
+    /// at least the `invite` power level there.
+    InviteUser { room_id: String, user_id: String },
     /// Fetch the public room directory of `server` (or the local server
     /// when empty), filtered by kind. Surfaces an `Update::PublicRooms`.
     DiscoverPublicRooms { server: String, kind: PublicKind },
@@ -852,6 +864,51 @@ async fn matrix_main(
                                     })
                                     .await;
                             }
+                        }
+                    });
+                }
+            }
+            Command::CreateRoom { name, is_direct, invite } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match create_room(&c, name.as_deref(), is_direct, &invite).await {
+                            Ok(label) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("room créée : {label}"),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Update::Error {
+                                        reason: format!("/create : {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            Command::InviteUser { room_id, user_id } => {
+                if let Some(c) = &client {
+                    let tx = update_tx.clone();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = invite_user(&c, &room_id, &user_id).await {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("/invite : {e}"),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(Update::Error {
+                                    reason: format!("invité : {user_id}"),
+                                })
+                                .await;
                         }
                     });
                 }
@@ -2253,6 +2310,57 @@ async fn leave_room(
     let parsed: OwnedRoomId = room_id.parse()?;
     let room = client.get_room(&parsed).ok_or("room introuvable")?;
     room.leave().await?;
+    Ok(())
+}
+
+/// Create a new room. `is_direct` flips the spec-level flag the homeserver
+/// uses to track DMs (it also adds the room to the inviter's `m.direct`
+/// account data via the SDK). For `/dm`, `invite` is the partner; for a
+/// plain `/create`, `invite` may be empty.
+async fn create_room(
+    client: &Client,
+    name: Option<&str>,
+    is_direct: bool,
+    invite: &[String],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
+    use matrix_sdk::ruma::api::client::room::Visibility;
+    use matrix_sdk::ruma::OwnedUserId;
+
+    let mut req = CreateRoomRequest::new();
+    if let Some(n) = name {
+        if !n.is_empty() {
+            req.name = Some(n.to_string());
+        }
+    }
+    let invite_parsed: Vec<OwnedUserId> = invite
+        .iter()
+        .map(|s| s.parse::<OwnedUserId>())
+        .collect::<Result<Vec<_>, _>>()?;
+    req.invite = invite_parsed;
+    req.is_direct = is_direct;
+    if is_direct {
+        use matrix_sdk::ruma::api::client::room::create_room::v3::RoomPreset;
+        req.preset = Some(RoomPreset::TrustedPrivateChat);
+        req.visibility = Visibility::Private;
+    }
+
+    let room = client.create_room(req).await?;
+    Ok(name.map(|s| s.to_string()).unwrap_or_else(|| room.room_id().to_string()))
+}
+
+/// Invite `user_id` to `room_id`. The local user must have at least the
+/// room's `invite` power level (default 0 for most rooms).
+async fn invite_user(
+    client: &Client,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::OwnedUserId;
+    let parsed_room: OwnedRoomId = room_id.parse()?;
+    let parsed_user: OwnedUserId = user_id.parse()?;
+    let room = client.get_room(&parsed_room).ok_or("room introuvable")?;
+    room.invite_user_by_id(&parsed_user).await?;
     Ok(())
 }
 

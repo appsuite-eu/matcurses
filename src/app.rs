@@ -130,6 +130,9 @@ const SLASH_COMMANDS: &[&str] = &[
     "rooms",
     "discover",
     "spaces",
+    "create",
+    "dm",
+    "invite",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1917,6 +1920,9 @@ impl App {
                     self.flash = Some("/leave indisponible (hors session)".into());
                 }
             }
+            "create" => self.create_room_cmd(args),
+            "dm" => self.dm_cmd(args),
+            "invite" => self.invite_cmd(args),
             "redact" | "del" => self.open_redact_confirm(),
             "edit" => self.start_edit(),
             "restore" | "recovery" => self.open_recovery_input(),
@@ -1954,6 +1960,77 @@ impl App {
             other => {
                 self.flash = Some(format!("commande inconnue : /{other}"));
             }
+        }
+    }
+
+    /// `/create [nom]` — creates a fresh private room (no DM flag, no
+    /// invites). The argument, if any, is the room name; whitespace is
+    /// stripped. Without it the room is unnamed and only shows the local
+    /// user; useful as a scratchpad.
+    pub fn create_room_cmd(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/create indisponible (hors session)".into());
+            return;
+        }
+        let name = args.trim();
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::CreateRoom {
+                name: if name.is_empty() { None } else { Some(name.to_string()) },
+                is_direct: false,
+                invite: Vec::new(),
+            });
+            self.flash = Some("création en cours…".into());
+        }
+    }
+
+    /// `/dm @user:server` — open (or create) a 1:1 DM with `user`. We
+    /// always create a fresh room; the homeserver's `m.direct` account
+    /// data picks it up so Element / other clients group it under the
+    /// People section.
+    pub fn dm_cmd(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/dm indisponible (hors session)".into());
+            return;
+        }
+        let target = args.trim();
+        if target.is_empty() || !target.starts_with('@') || !target.contains(':') {
+            self.flash = Some("/dm @user:server".into());
+            return;
+        }
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::CreateRoom {
+                name: None,
+                is_direct: true,
+                invite: vec![target.to_string()],
+            });
+            self.flash = Some(format!("DM avec {target} en cours…"));
+        }
+    }
+
+    /// `/invite @user:server` — invite a user to the active room. Fails
+    /// loudly if no room is focused or the user is not joined to one.
+    pub fn invite_cmd(&mut self, args: &str) {
+        if !self.matrix_logged_in {
+            self.flash = Some("/invite indisponible (hors session)".into());
+            return;
+        }
+        let target = args.trim();
+        if target.is_empty() || !target.starts_with('@') || !target.contains(':') {
+            self.flash = Some("/invite @user:server".into());
+            return;
+        }
+        let room_id = match self.current_room_id.clone() {
+            Some(id) => id,
+            None => {
+                self.flash = Some("/invite : aucune room active".into());
+                return;
+            }
+        };
+        if let Some(b) = self.matrix.as_ref() {
+            b.send(MxCommand::InviteUser {
+                room_id,
+                user_id: target.to_string(),
+            });
         }
     }
 
@@ -2112,6 +2189,9 @@ impl App {
             "/me <texte>            action / emote (m.emote)".into(),
             "/join <#room:server>   rejoindre une room".into(),
             "/leave, /part          quitter la room courante".into(),
+            "/create [nom]          créer une nouvelle room privée".into(),
+            "/dm @user:server       ouvrir un DM 1:1".into(),
+            "/invite @user:server   inviter un utilisateur dans la room".into(),
             "/redact, /del          supprimer le message courant".into(),
             "/edit                  éditer le message courant (E)".into(),
             "/react                 ouvrir le picker de réactions".into(),
